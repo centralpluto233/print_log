@@ -1,0 +1,41 @@
+add_print:
+  fields:
+    length_m:
+      required: true
+      selector:
+        number:
+          min: 0
+          step: 0.001
+          mode: box
+          unit_of_measurement: m
+    filename:
+      selector:
+        text:
+    person:
+      selector:
+        text:
+    filament:
+      selector:
+        text:
+    role:
+      selector:
+        text:
+    status:
+      default: complete
+      selector:
+        select:
+          options: [complete, cancelled, error]
+    notes:
+      selector:
+        text:
+set_current:
+  fields:
+    person:
+      selector:
+        text:
+    filament:
+      selector:
+        text:
+    role:
+      selector:
+        text:

@@ -1,0 +1,28 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Print Log",
+        "description": "Pick the Moonraker entities.",
+        "data": {
+          "state_entity": "Print state",
+          "filename_entity": "Filename",
+          "filament_entity": "Filament used",
+          "length_unit": "Unit (when the sensor has none)"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "state_entity": "Print state",
+          "filename_entity": "Filename",
+          "filament_entity": "Filament used",
+          "length_unit": "Unit (when the sensor has none)"
+        }
+      }
+    }
+  }
+}
