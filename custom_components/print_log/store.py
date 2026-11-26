@@ -7,14 +7,15 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .costs import MICRO, compute_costs, euro_to_micro, micro_to_euro
+from .costs import compute_costs, euro_to_micro, micro_to_euro
+from .defaults import DEFAULT_NOTIFICATIONS, DEFAULT_STATE_MAP
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_ROLES = ("familie", "vrienden", "extern")
 
 SCHEMA = """
@@ -50,33 +51,49 @@ CREATE INDEX IF NOT EXISTS idx_prints_person ON prints(person_id);
 CREATE INDEX IF NOT EXISTS idx_prints_ended ON prints(ended_at);
 """
 
+MIGRATIONS = {
+    2: [
+        """CREATE TABLE IF NOT EXISTS printers (
+          id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL,
+          state_entity TEXT, state_map TEXT, filename_entity TEXT, filament_entity TEXT,
+          length_unit TEXT NOT NULL DEFAULT 'mm', progress_entity TEXT, remaining_entity TEXT,
+          energy_entity TEXT, current_person_id INTEGER, current_role_id INTEGER,
+          current_filament_id INTEGER, archived INTEGER NOT NULL DEFAULT 0)""",
+        "ALTER TABLE prints ADD COLUMN printer_id INTEGER REFERENCES printers(id)",
+        "ALTER TABLE prints ADD COLUMN energy_price_micro INTEGER",
+        "CREATE INDEX IF NOT EXISTS idx_prints_printer ON prints(printer_id)",
+    ],
+}
+
+PRINTER_ENTITY_KEYS = ("state_entity", "filename_entity", "filament_entity", "progress_entity",
+                       "remaining_entity", "energy_entity")
 TABLE_FIELDS = {
     "roles": ("name", "modifier_pct", "archived"),
     "people": ("name", "default_role_id", "modifier_pct", "archived"),
     "filaments": ("name", "material", "price_per_m_micro", "archived"),
+    "printers": ("name", "state_map", "length_unit", "current_person_id", "current_role_id",
+                 "current_filament_id", "archived", *PRINTER_ENTITY_KEYS),
 }
+FK = {"people": "person_id", "roles": "role_id", "filaments": "filament_id", "printers": "printer_id"}
 PRINT_FIELDS = (
-    "filename", "person_id", "role_id", "filament_id", "status", "started_at",
-    "ended_at", "duration_s", "length_m", "length_auto_m", "energy_kwh",
-    "thumbnail", "source", "price_per_m_micro", "modifier_pct",
-    "energy_cost_micro", "notes",
+    "filename", "person_id", "role_id", "filament_id", "printer_id", "status", "started_at",
+    "ended_at", "duration_s", "length_m", "length_auto_m", "energy_kwh", "thumbnail", "source",
+    "price_per_m_micro", "modifier_pct", "energy_cost_micro", "energy_price_micro", "notes",
 )
 SORTS = {
-    "ended_at": "p.ended_at", "filename": "p.filename COLLATE NOCASE",
-    "length_m": "p.length_m", "total_cost": "p.total_cost_micro",
-    "duration_s": "p.duration_s", "person": "pe.name COLLATE NOCASE",
+    "ended_at": "p.ended_at", "filename": "p.filename COLLATE NOCASE", "length_m": "p.length_m",
+    "total_cost": "p.total_cost_micro", "duration_s": "p.duration_s", "person": "pe.name COLLATE NOCASE",
     "filament": "f.name COLLATE NOCASE", "status": "p.status", "role": "r.name COLLATE NOCASE",
+    "printer": "pr.name COLLATE NOCASE", "energy_kwh": "p.energy_kwh",
 }
 GROUPS = {
-    "person": "COALESCE(pe.name, '(onbekend)')",
-    "role": "COALESCE(r.name, '(geen rol)')",
-    "filament": "COALESCE(f.name, '(onbekend)')",
-    "month": "COALESCE(substr(p.ended_at, 1, 7), '(onbekend)')",
-    "status": "p.status",
+    "person": "COALESCE(pe.name, '(?)')", "role": "COALESCE(r.name, '(?)')",
+    "filament": "COALESCE(f.name, '(?)')", "printer": "COALESCE(pr.name, '(?)')",
+    "month": "COALESCE(substr(p.ended_at, 1, 7), '(?)')", "status": "p.status",
 }
 BASE_FROM = (
-    "FROM prints p LEFT JOIN people pe ON pe.id = p.person_id "
-    "LEFT JOIN roles r ON r.id = p.role_id LEFT JOIN filaments f ON f.id = p.filament_id"
+    "FROM prints p LEFT JOIN people pe ON pe.id = p.person_id LEFT JOIN roles r ON r.id = p.role_id "
+    "LEFT JOIN filaments f ON f.id = p.filament_id LEFT JOIN printers pr ON pr.id = p.printer_id"
 )
 
 
@@ -85,15 +102,11 @@ def utc_now_iso() -> str:
 
 
 def _num(v, default=None):
-    if v in (None, ""):
-        return default
-    return float(v)
+    return default if v in (None, "") else float(v)
 
 
 def _int(v, default=None):
-    if v in (None, ""):
-        return default
-    return int(v)
+    return default if v in (None, "") else int(v)
 
 
 class Store:
@@ -123,11 +136,15 @@ class Store:
         with self._db() as c:
             c.executescript(SCHEMA)
             if self._get(c, "schema_version") is None:
-                self._set(c, "schema_version", SCHEMA_VERSION)
+                self._set(c, "schema_version", 1)
                 for name in DEFAULT_ROLES:
                     c.execute("INSERT OR IGNORE INTO roles(name) VALUES (?)", (name,))
-            for k, v in (("failed_cost_pct", 100), ("energy_price_micro", 0)):
-                if self._get(c, k) is None:
+            for target in range(self._get(c, "schema_version", 1) + 1, SCHEMA_VERSION + 1):
+                for stmt in MIGRATIONS.get(target, []):
+                    c.execute(stmt)
+                self._set(c, "schema_version", target)
+            for k, v in (("failed_cost_pct", 100), ("energy_price_micro", 0), ("energy_price_entity", None)):
+                if self._get(c, k, "__none__") == "__none__" and self._get(c, k) is None:
                     self._set(c, k, v)
 
     @staticmethod
@@ -147,45 +164,62 @@ class Store:
         with self._db() as c:
             self._set(c, key, value)
 
+    @staticmethod
+    def _notif(c) -> dict:
+        saved = Store._get(c, "notifications", {}) or {}
+        return {**DEFAULT_NOTIFICATIONS, **{k: v for k, v in saved.items() if k in DEFAULT_NOTIFICATIONS}}
+
     def get_settings(self) -> dict[str, Any]:
+        hidden = ("session", "schema_version", "legacy_imported", "notifications")
         with self._db() as c:
-            return {r["key"]: json.loads(r["value"]) for r in c.execute("SELECT * FROM settings")
-                    if r["key"] not in ("session", "schema_version", "legacy_imported")}
+            out = {r["key"]: json.loads(r["value"]) for r in c.execute("SELECT * FROM settings")
+                   if r["key"] not in hidden and not r["key"].startswith("session_")}
+            out["notifications"] = self._notif(c)
+        return out
 
     def update_settings(self, data: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"failed_cost_pct": float, "energy_price_micro": int,
-                   "current_person_id": lambda v: _int(v), "current_role_id": lambda v: _int(v),
-                   "current_filament_id": lambda v: _int(v)}
+        simple = {"failed_cost_pct": float, "energy_price_micro": int,
+                  "energy_price_entity": lambda v: str(v).strip() or None}
         with self._db() as c:
             for k, v in data.items():
-                if k in allowed:
-                    self._set(c, k, allowed[k](v) if v is not None else None)
+                if k in simple:
+                    self._set(c, k, simple[k](v) if v is not None else None)
+                elif k == "notifications" and isinstance(v, dict):
+                    merged = self._notif(c)
+                    for nk, nv in v.items():
+                        base = DEFAULT_NOTIFICATIONS.get(nk)
+                        if base is None:
+                            continue
+                        if isinstance(base, bool):
+                            merged[nk] = bool(nv)
+                        elif isinstance(base, int):
+                            merged[nk] = max(0, int(nv))
+                        elif isinstance(base, list):
+                            merged[nk] = [str(x) for x in (nv or [])]
+                        else:
+                            merged[nk] = str(nv or "")
+                    self._set(c, "notifications", merged)
         return self.get_settings()
 
-    # ---------- people / roles / filaments ----------
+    # ---------- people / roles / filaments / printers ----------
     def list_table(self, table: str, include_archived: bool = True) -> list[dict]:
         if table not in TABLE_FIELDS:
             raise ValueError("unknown table")
         with self._db() as c:
             where = "" if include_archived else "WHERE archived = 0"
             rows = [dict(r) for r in c.execute(f"SELECT * FROM {table} {where} ORDER BY name COLLATE NOCASE")]
-            counts = {r["k"]: r["n"] for r in c.execute(
-                f"SELECT {self._fk(table)} AS k, COUNT(*) AS n FROM prints GROUP BY k")}
+            counts = {r["k"]: r["n"] for r in c.execute(f"SELECT {FK[table]} AS k, COUNT(*) AS n FROM prints GROUP BY k")}
         for r in rows:
             r["print_count"] = counts.get(r["id"], 0)
             if table == "filaments":
                 r["price_per_m"] = micro_to_euro(r["price_per_m_micro"])
+            if table == "printers":
+                sm = json.loads(r["state_map"] or "{}")
+                r["state_map"] = {k: sm.get(k) or v for k, v in DEFAULT_STATE_MAP.items()}
         return rows
 
-    @staticmethod
-    def _fk(table):
-        return {"people": "person_id", "roles": "role_id", "filaments": "filament_id"}[table]
-
     def _clean(self, table, data, partial=False):
-        out = {}
-        for k in TABLE_FIELDS[table]:
-            if k in data:
-                out[k] = data[k]
+        out = {k: data[k] for k in TABLE_FIELDS[table] if k in data}
         if table == "filaments" and "price_per_m" in data:
             out["price_per_m_micro"] = euro_to_micro(data["price_per_m"])
         if "name" in out:
@@ -194,12 +228,22 @@ class Store:
                 raise ValueError("name is required")
         elif not partial:
             raise ValueError("name is required")
-        for k in ("modifier_pct",):
+        if "modifier_pct" in out:
+            out["modifier_pct"] = _num(out["modifier_pct"], None if table == "people" else 0.0)
+        for k in PRINTER_ENTITY_KEYS:
             if k in out:
-                out[k] = _num(out[k], None if table == "people" else 0.0)
-        for k in ("default_role_id", "price_per_m_micro"):
+                out[k] = str(out[k] or "").strip() or None
+        if "state_map" in out:
+            sm = out["state_map"] if isinstance(out["state_map"], dict) else {}
+            out["state_map"] = json.dumps({k: [str(x).strip() for x in (sm.get(k) or []) if str(x).strip()]
+                                           for k in DEFAULT_STATE_MAP})
+        if "length_unit" in out and out["length_unit"] not in ("mm", "cm", "m"):
+            out["length_unit"] = "mm"
+        for k in ("default_role_id", "current_person_id", "current_role_id", "current_filament_id"):
             if k in out:
-                out[k] = _int(out[k], None if k == "default_role_id" else 0)
+                out[k] = _int(out[k])
+        if "price_per_m_micro" in out:
+            out["price_per_m_micro"] = _int(out["price_per_m_micro"], 0)
         if "archived" in out:
             out["archived"] = 1 if out["archived"] else 0
         return out
@@ -208,22 +252,20 @@ class Store:
         d = self._clean(table, data)
         with self._db() as c:
             cur = c.execute(f"INSERT INTO {table}({','.join(d)}) VALUES ({','.join('?' * len(d))})", list(d.values()))
-            row = dict(c.execute(f"SELECT * FROM {table} WHERE id=?", (cur.lastrowid,)).fetchone())
-        return row
+            return dict(c.execute(f"SELECT * FROM {table} WHERE id=?", (cur.lastrowid,)).fetchone())
 
     def update_item(self, table: str, item_id: int, data: dict) -> dict | None:
         d = self._clean(table, data, partial=True)
         with self._db() as c:
             if d:
-                sets = ",".join(f"{k}=?" for k in d)
-                c.execute(f"UPDATE {table} SET {sets} WHERE id=?", [*d.values(), item_id])
+                c.execute(f"UPDATE {table} SET {','.join(k + '=?' for k in d)} WHERE id=?", [*d.values(), item_id])
             row = c.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
         return dict(row) if row else None
 
     def delete_item(self, table: str, item_id: int) -> str:
         """Delete, or archive when prints still reference it. Returns 'deleted' or 'archived'."""
         with self._db() as c:
-            n = c.execute(f"SELECT COUNT(*) FROM prints WHERE {self._fk(table)}=?", (item_id,)).fetchone()[0]
+            n = c.execute(f"SELECT COUNT(*) FROM prints WHERE {FK[table]}=?", (item_id,)).fetchone()[0]
             if table == "roles":
                 n += c.execute("SELECT COUNT(*) FROM people WHERE default_role_id=?", (item_id,)).fetchone()[0]
             if n:
@@ -240,28 +282,37 @@ class Store:
                 return row["id"]
         return self.add_item(table, {"name": name, **extra})["id"]
 
+    def ensure_default_printer(self, conf: dict) -> bool:
+        """Create the first printer from the config entry (install, or upgrade from 0.1.x)."""
+        with self._db() as c:
+            if c.execute("SELECT COUNT(*) FROM printers").fetchone()[0]:
+                return False
+            old = {k: self._get(c, k) for k in ("current_person_id", "current_role_id", "current_filament_id")}
+            data = {k: conf.get(k) for k in PRINTER_ENTITY_KEYS}
+            data.update(name=conf.get("name") or "Printer", length_unit=conf.get("length_unit") or "mm",
+                        state_map=conf.get("state_map") or {}, **old)
+            d = self._clean("printers", data)
+            cur = c.execute(f"INSERT INTO printers({','.join(d)}) VALUES ({','.join('?' * len(d))})", list(d.values()))
+            c.execute("UPDATE prints SET printer_id=? WHERE printer_id IS NULL", (cur.lastrowid,))
+        return True
+
     # ---------- prints ----------
     def _prepare(self, c, d: dict, existing: dict | None) -> dict:
         row = dict(existing or {})
-        changed_person = existing is not None and "person_id" in d and d["person_id"] != existing["person_id"]
-        changed_role = existing is not None and "role_id" in d and d["role_id"] != existing["role_id"]
-        changed_fil = existing is not None and "filament_id" in d and d["filament_id"] != existing["filament_id"]
+        was = lambda k: existing is not None and k in d and d[k] != existing[k]  # noqa: E731
+        changed_person, changed_role, changed_fil = was("person_id"), was("role_id"), was("filament_id")
         if changed_person and "role_id" not in d:
             d = {**d, "role_id": None}
             changed_role = True
-        for k in PRINT_FIELDS:
-            if k in d:
-                row[k] = d[k]
+        row.update({k: d[k] for k in PRINT_FIELDS if k in d})
         row.setdefault("status", "complete")
-        for k in ("person_id", "role_id", "filament_id"):
+        for k in ("person_id", "role_id", "filament_id", "printer_id", "duration_s"):
             row[k] = _int(row.get(k))
         row["length_m"] = _num(row.get("length_m"), 0.0)
         row["energy_kwh"] = _num(row.get("energy_kwh"))
-        row["duration_s"] = _int(row.get("duration_s"))
         person = c.execute("SELECT * FROM people WHERE id=?", (row["person_id"],)).fetchone() if row["person_id"] else None
         if row["role_id"] is None and person and person["default_role_id"]:
-            row["role_id"] = person["default_role_id"]
-            changed_role = True
+            row["role_id"], changed_role = person["default_role_id"], True
         if row.get("duration_s") is None and row.get("started_at") and row.get("ended_at"):
             try:
                 a = datetime.fromisoformat(row["started_at"].replace("Z", "+00:00"))
@@ -277,21 +328,21 @@ class Store:
         if "modifier_pct" in d:
             row["modifier_pct"] = _num(d["modifier_pct"], 0.0)
         elif existing is None or changed_person or changed_role:
-            mod = None
-            if person and person["modifier_pct"] is not None:
-                mod = person["modifier_pct"]
-            elif row["role_id"]:
+            mod = person["modifier_pct"] if person and person["modifier_pct"] is not None else None
+            if mod is None and row["role_id"]:
                 r = c.execute("SELECT modifier_pct FROM roles WHERE id=?", (row["role_id"],)).fetchone()
                 mod = r["modifier_pct"] if r else None
             row["modifier_pct"] = mod or 0.0
-        energy_price = self._get(c, "energy_price_micro", 0) or 0
-        if row.get("energy_kwh") is not None and energy_price and "energy_cost_micro" not in d:
-            row["energy_cost_micro"] = int(round(row["energy_kwh"] * energy_price))
+        if "energy_price_micro" in d:
+            row["energy_price_micro"] = _int(d["energy_price_micro"])
+        elif existing is None and row.get("energy_kwh") is not None:
+            row["energy_price_micro"] = self._get(c, "energy_price_micro", 0) or 0
+        if row.get("energy_kwh") is not None and row.get("energy_price_micro") and "energy_cost_micro" not in d:
+            row["energy_cost_micro"] = int(round(row["energy_kwh"] * row["energy_price_micro"]))
         row["energy_cost_micro"] = _int(row.get("energy_cost_micro"), 0)
         row.update(compute_costs(
             row["length_m"], row["price_per_m_micro"], energy_micro=row["energy_cost_micro"],
-            modifier_pct=row["modifier_pct"], status=row["status"],
-            failed_cost_pct=self._get(c, "failed_cost_pct", 100)))
+            modifier_pct=row["modifier_pct"], status=row["status"], failed_cost_pct=self._get(c, "failed_cost_pct", 100)))
         row["filename"] = (row.get("filename") or "").strip()
         return row
 
@@ -300,13 +351,10 @@ class Store:
     def add_print(self, data: dict) -> dict:
         with self._db() as c:
             row = self._prepare(c, data, None)
-            row.setdefault("ended_at", utc_now_iso())
-            if not row.get("ended_at"):
-                row["ended_at"] = utc_now_iso()
+            row["ended_at"] = row.get("ended_at") or utc_now_iso()
             row.setdefault("source", "manual")
             cols = [k for k in self.COLS if k in row]
-            cur = c.execute(f"INSERT INTO prints({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", [row[k] for k in cols])
-            pid = cur.lastrowid
+            pid = c.execute(f"INSERT INTO prints({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", [row[k] for k in cols]).lastrowid
         return self.get_print(pid)
 
     def update_print(self, print_id: int, data: dict) -> dict | None:
@@ -323,18 +371,14 @@ class Store:
         with self._db() as c:
             return c.execute("DELETE FROM prints WHERE id=?", (print_id,)).rowcount > 0
 
-    SELECT = (
-        "SELECT p.*, pe.name AS person, r.name AS role, f.name AS filament, f.material AS material "
-        + BASE_FROM
-    )
+    SELECT = ("SELECT p.*, pe.name AS person, r.name AS role, f.name AS filament, f.material AS material, "
+              "pr.name AS printer " + BASE_FROM)
 
     @staticmethod
     def _out(r: sqlite3.Row) -> dict:
         d = dict(r)
-        d["material_cost"] = micro_to_euro(d["material_cost_micro"])
-        d["energy_cost"] = micro_to_euro(d["energy_cost_micro"])
-        d["total_cost"] = micro_to_euro(d["total_cost_micro"])
-        d["price_per_m"] = micro_to_euro(d["price_per_m_micro"])
+        for k in ("material_cost", "energy_cost", "total_cost", "price_per_m"):
+            d[k] = micro_to_euro(d[k + "_micro"])
         d["incomplete"] = d["person_id"] is None or d["filament_id"] is None
         return d
 
@@ -346,7 +390,8 @@ class Store:
     @staticmethod
     def _where(f: dict) -> tuple[str, list]:
         cl, args = [], []
-        for key, col in (("person", "p.person_id"), ("role", "p.role_id"), ("filament", "p.filament_id"), ("status", "p.status")):
+        for key, col in (("person", "p.person_id"), ("role", "p.role_id"), ("filament", "p.filament_id"),
+                         ("printer", "p.printer_id"), ("status", "p.status")):
             v = f.get(key)
             if v in (None, "", "all"):
                 continue
@@ -372,10 +417,11 @@ class Store:
         order = SORTS.get(sort, SORTS["ended_at"]) + (" DESC" if desc else " ASC")
         with self._db() as c:
             total = c.execute(f"SELECT COUNT(*) {BASE_FROM}{where}", args).fetchone()[0]
-            sums = c.execute(f"SELECT COALESCE(SUM(p.total_cost_micro),0) t, COALESCE(SUM(p.length_m),0) l {BASE_FROM}{where}", args).fetchone()
+            sums = c.execute(f"SELECT COALESCE(SUM(p.total_cost_micro),0) t, COALESCE(SUM(p.length_m),0) l, "
+                             f"COALESCE(SUM(p.energy_kwh),0) e {BASE_FROM}{where}", args).fetchone()
             rows = c.execute(f"{self.SELECT}{where} ORDER BY {order}, p.id DESC LIMIT ? OFFSET ?", [*args, limit, offset]).fetchall()
         return {"total": total, "total_cost": micro_to_euro(sums["t"]), "total_length_m": round(sums["l"], 3),
-                "items": [self._out(r) for r in rows]}
+                "total_energy_kwh": round(sums["e"], 3), "items": [self._out(r) for r in rows]}
 
     def stats(self, group_by: str, f: dict) -> list[dict]:
         key = GROUPS.get(group_by)
@@ -386,16 +432,17 @@ class Store:
         with self._db() as c:
             rows = c.execute(
                 f"SELECT {key} AS k, COUNT(*) AS prints, SUM(p.length_m) AS length_m, "
-                f"COALESCE(SUM(p.duration_s),0) AS duration_s, SUM(p.total_cost_micro) AS cost "
-                f"{BASE_FROM}{where} GROUP BY k ORDER BY {order}", args).fetchall()
+                f"COALESCE(SUM(p.duration_s),0) AS duration_s, SUM(p.total_cost_micro) AS cost, "
+                f"COALESCE(SUM(p.energy_kwh),0) AS kwh {BASE_FROM}{where} GROUP BY k ORDER BY {order}", args).fetchall()
         return [{"key": r["k"], "prints": r["prints"], "length_m": round(r["length_m"] or 0, 3),
-                 "duration_s": r["duration_s"], "total_cost": micro_to_euro(r["cost"])} for r in rows]
+                 "duration_s": r["duration_s"], "energy_kwh": round(r["kwh"], 3),
+                 "total_cost": micro_to_euro(r["cost"])} for r in rows]
 
     def export_csv(self, f: dict) -> str:
         data = self.list_prints(f, limit=1_000_000)["items"]
         buf = io.StringIO()
-        cols = ["id", "ended_at", "started_at", "duration_s", "filename", "person", "role", "filament",
-                "status", "length_m", "price_per_m", "material_cost", "energy_cost", "modifier_pct", "total_cost", "notes"]
+        cols = ["id", "ended_at", "started_at", "duration_s", "filename", "printer", "person", "role", "filament", "status",
+                "length_m", "price_per_m", "material_cost", "energy_kwh", "energy_cost", "modifier_pct", "total_cost", "notes"]
         wr = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
         wr.writeheader()
         wr.writerows(data)
@@ -425,7 +472,8 @@ class Store:
 
     def _import_rows(self, rollen: list[dict], old: list[dict]) -> int:
         with self._db() as c:
-            fil_ids, fil_price = {}, {}
+            fil_ids, fil_price, people, n = {}, {}, {}, 0
+
             def fil(name, material=None, price=0.0):
                 key = name.strip().lower()
                 if key not in fil_ids:
@@ -437,10 +485,9 @@ class Store:
                                         (name.strip(), material, euro_to_micro(price)))
                         fil_ids[key], fil_price[key] = cur.lastrowid, euro_to_micro(price)
                 return fil_ids[key], fil_price[key]
+
             for r in rollen:
                 fil(r["naam"], r.get("materiaal"), r.get("prijs_per_m") or 0)
-            people = {}
-            n = 0
             for r in old:
                 name = (r["persoon"] or "").strip() or None
                 pid = None
@@ -449,7 +496,7 @@ class Store:
                         row = c.execute("SELECT id FROM people WHERE name=? COLLATE NOCASE", (name,)).fetchone()
                         people[name.lower()] = row["id"] if row else c.execute("INSERT INTO people(name) VALUES (?)", (name,)).lastrowid
                     pid = people[name.lower()]
-                fid, fprice = (fil(r["rol"]) if r["rol"] else (None, 0))
+                fid, fprice = fil(r["rol"]) if r["rol"] else (None, 0)
                 length = float(r["lengte_m"] or 0)
                 total = euro_to_micro(r["prijs"] or 0)
                 ppm = int(round(total / length)) if length > 0 else fprice
