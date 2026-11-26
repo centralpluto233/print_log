@@ -2,7 +2,7 @@
 import {LANGS, makeT} from "./i18n.js";
 
 const CSS = `
-:host{display:block;height:100%;overflow:auto;background:var(--primary-background-color);color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family,Roboto,sans-serif);color-scheme:light dark}
+:host{display:block;height:100%;min-height:100vh;overflow:auto;background:var(--primary-background-color);color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family,Roboto,sans-serif);color-scheme:light dark}
 :host([data-theme="light"]){--primary-background-color:#f3f5f7;--card-background-color:#fff;--primary-text-color:#1f2328;--secondary-text-color:#59636e;--divider-color:#d0d7de;color-scheme:light}
 :host([data-theme="dark"]){--primary-background-color:#111418;--card-background-color:#1c2128;--primary-text-color:#e6edf3;--secondary-text-color:#9aa4af;--divider-color:#30363d;color-scheme:dark}
 *{box-sizing:border-box}
