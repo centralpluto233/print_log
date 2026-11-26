@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant
 from .const import DOMAIN
 from .data import PrintLogData
 
-TABLES = ("people", "roles", "filaments")
+TABLES = ("people", "roles", "filaments", "printers")
 
 
 def _is_admin(request: web.Request) -> bool:
@@ -37,16 +37,16 @@ class _Base(HomeAssistantView):
     async def _run(self, func, *args, **kwargs):
         return await self.hass.async_add_executor_job(partial(func, *args, **kwargs))
 
-    async def _write(self, request: web.Request, func, *args, **kwargs):
+    async def _write(self, request: web.Request, func, *args, _reload: bool = False):
         if not _is_admin(request):
             return _err(403, "admin required")
         try:
-            result = await self._run(func, *args, **kwargs)
+            result = await self._run(func, *args)
         except (ValueError, TypeError) as e:
             return _err(400, str(e))
         except sqlite3.IntegrityError as e:
             return _err(409, f"conflict: {e}")
-        await self.data.async_refresh()
+        await self.data.async_refresh(reload=_reload)
         return result
 
     @staticmethod
@@ -59,9 +59,19 @@ class _Base(HomeAssistantView):
             raise ValueError("JSON object expected")
         return body
 
+    async def _body_write(self, request, func, *args, status=200, _reload=False, **_):
+        try:
+            body = await self._json(request)
+        except ValueError as e:
+            return _err(400, str(e))
+        res = await self._write(request, func, *args, body, _reload=_reload)
+        if isinstance(res, web.Response):
+            return res
+        return _err(404, "not found") if res is None else web.json_response(res, status=status)
+
 
 def _filters(request: web.Request) -> dict:
-    keys = ("person", "role", "filament", "status", "from", "to", "min_duration", "max_duration", "q")
+    keys = ("person", "role", "filament", "printer", "status", "from", "to", "min_duration", "max_duration", "q")
     return {k: request.query[k] for k in keys if k in request.query}
 
 
@@ -79,13 +89,11 @@ class PrintsView(_Base):
         return web.json_response(res)
 
     async def post(self, request):
-        try:
-            body = await self._json(request)
-        except ValueError as e:
-            return _err(400, str(e))
+        return await self._body_write(request, self._add, status=201)
+
+    def _add(self, body):
         body.setdefault("source", "manual")
-        res = await self._write(request, self.data.store.add_print, body)
-        return res if isinstance(res, web.Response) else web.json_response(res, status=201)
+        return self.data.store.add_print(body)
 
 
 class PrintView(_Base):
@@ -96,14 +104,7 @@ class PrintView(_Base):
         return web.json_response(row) if row else _err(404, "not found")
 
     async def put(self, request, item_id):
-        try:
-            body = await self._json(request)
-        except ValueError as e:
-            return _err(400, str(e))
-        res = await self._write(request, self.data.store.update_print, int(item_id), body)
-        if res is None:
-            return _err(404, "not found")
-        return res if isinstance(res, web.Response) else web.json_response(res)
+        return await self._body_write(request, self.data.store.update_print, int(item_id))
 
     async def delete(self, request, item_id):
         res = await self._write(request, self.data.store.delete_print, int(item_id))
@@ -120,16 +121,11 @@ class CollectionView(_Base):
         self.name = f"api:print_log:{table}"
 
     async def get(self, request):
-        rows = await self._run(self.data.store.list_table, self.table, True)
-        return web.json_response(rows)
+        return web.json_response(await self._run(self.data.store.list_table, self.table, True))
 
     async def post(self, request):
-        try:
-            body = await self._json(request)
-        except ValueError as e:
-            return _err(400, str(e))
-        res = await self._write(request, self.data.store.add_item, self.table, body)
-        return res if isinstance(res, web.Response) else web.json_response(res, status=201)
+        return await self._body_write(request, self.data.store.add_item, self.table, status=201,
+                                      _reload=self.table == "printers")
 
 
 class ItemView(_Base):
@@ -140,17 +136,12 @@ class ItemView(_Base):
         self.name = f"api:print_log:{table}:item"
 
     async def put(self, request, item_id):
-        try:
-            body = await self._json(request)
-        except ValueError as e:
-            return _err(400, str(e))
-        res = await self._write(request, self.data.store.update_item, self.table, int(item_id), body)
-        if res is None:
-            return _err(404, "not found")
-        return res if isinstance(res, web.Response) else web.json_response(res)
+        return await self._body_write(request, self.data.store.update_item, self.table, int(item_id),
+                                      _reload=self.table == "printers")
 
     async def delete(self, request, item_id):
-        res = await self._write(request, self.data.store.delete_item, self.table, int(item_id))
+        res = await self._write(request, self.data.store.delete_item, self.table, int(item_id),
+                                _reload=self.table == "printers")
         return res if isinstance(res, web.Response) else web.json_response({"result": res})
 
 
@@ -181,12 +172,7 @@ class SettingsView(_Base):
         return web.json_response(await self._run(self.data.store.get_settings))
 
     async def put(self, request):
-        try:
-            body = await self._json(request)
-        except ValueError as e:
-            return _err(400, str(e))
-        res = await self._write(request, self.data.store.update_settings, body)
-        return res if isinstance(res, web.Response) else web.json_response(res)
+        return await self._body_write(request, self.data.store.update_settings, _reload=True)
 
 
 def async_register_views(hass: HomeAssistant) -> None:

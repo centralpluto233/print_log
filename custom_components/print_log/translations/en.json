@@ -3,24 +3,16 @@
     "step": {
       "user": {
         "title": "Print Log",
-        "description": "Pick the Moonraker entities.",
+        "description": "Set up your first printer. You can add and edit printers later in the Print log panel (Printers tab).",
         "data": {
-          "state_entity": "Print state",
-          "filename_entity": "Filename",
-          "filament_entity": "Filament used",
-          "length_unit": "Unit (when the sensor has none)"
-        }
-      }
-    }
-  },
-  "options": {
-    "step": {
-      "init": {
-        "data": {
-          "state_entity": "Print state",
-          "filename_entity": "Filename",
-          "filament_entity": "Filament used",
-          "length_unit": "Unit (when the sensor has none)"
+          "name": "Printer name",
+          "state_entity": "Print state (required)",
+          "filename_entity": "Filename (optional)",
+          "filament_entity": "Filament used (optional)",
+          "length_unit": "Unit when the sensor has none",
+          "progress_entity": "Progress in % (optional)",
+          "remaining_entity": "Time remaining (optional)",
+          "energy_entity": "Energy counter kWh or Wh, e.g. Shelly (optional)"
         }
       }
     }

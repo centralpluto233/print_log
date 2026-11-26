@@ -1,111 +1,146 @@
-"""Follows the Moonraker entities and logs a print when it ends."""
+"""Follows the entities of each printer and logs a print when it ends."""
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 
-from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.event import async_track_state_change_event
 
-from .const import (
-    CONF_FILAMENT_ENTITY, CONF_FILENAME_ENTITY, CONF_LENGTH_UNIT, CONF_STATE_ENTITY,
-    END_STATES, EVENT_PRINT_FINISHED, UNIT_FACTORS,
-)
+from .const import EVENT_PRINT_FINISHED
 from .data import PrintLogData
+from .helpers import map_state, pretty_name, to_kwh, to_meters, to_percent, to_seconds, to_float
 
 _LOGGER = logging.getLogger(__name__)
-_BAD = (STATE_UNKNOWN, STATE_UNAVAILABLE, None, "")
+END_STATUS = {"complete": "complete", "cancelled": "cancelled", "error": "error", "idle": "cancelled"}
 
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-class PrintTracker:
-    def __init__(self, hass: HomeAssistant, data: PrintLogData, conf: dict) -> None:
-        self.hass = hass
-        self.data = data
-        self.state_id = conf[CONF_STATE_ENTITY]
-        self.file_id = conf.get(CONF_FILENAME_ENTITY)
-        self.fil_id = conf.get(CONF_FILAMENT_ENTITY)
-        self.default_unit = conf.get(CONF_LENGTH_UNIT, "mm")
+class PrinterTracker:
+    def __init__(self, hass: HomeAssistant, data: PrintLogData, printer: dict) -> None:
+        self.hass, self.data, self.p = hass, data, printer
+        self.key = f"session_{printer['id']}"
         self.session: dict | None = None
         self._unsub = None
+        self._persisted = 0.0
+
+    def _state(self, entity: str | None):
+        return self.hass.states.get(entity) if entity else None
 
     async def async_start(self) -> None:
-        self.session = await self.hass.async_add_executor_job(self.data.store.get_setting, "session")
-        ids = [e for e in (self.state_id, self.file_id, self.fil_id) if e]
+        self.session = await self.hass.async_add_executor_job(self.data.store.get_setting, self.key)
+        ids = [self.p[k] for k in ("state_entity", "filename_entity", "filament_entity", "progress_entity",
+                                   "remaining_entity") if self.p.get(k)]
         self._unsub = async_track_state_change_event(self.hass, ids, self._handle)
-        st = self.hass.states.get(self.state_id)
-        if st and st.state == "printing" and not self.session:
+        st = self._state(self.p["state_entity"])
+        if st and map_state(st.state, self.p["state_map"]) == "printing" and not self.session:
             self._begin()
 
     def async_stop(self) -> None:
         if self._unsub:
             self._unsub()
+            self._unsub = None
+        self._persist(force=True)
 
-    def _persist(self) -> None:
-        self.hass.async_add_executor_job(self.data.store.set_setting, "session", self.session)
+    def _persist(self, force: bool = False) -> None:
+        if not force and time.monotonic() - self._persisted < 60:
+            return
+        self._persisted = time.monotonic()
+        self.hass.async_add_executor_job(self.data.store.set_setting, self.key, self.session)
 
-    def _length_m(self, state) -> float | None:
-        if state is None or state.state in _BAD:
-            return None
-        try:
-            value = float(state.state)
-        except ValueError:
-            return None
-        unit = state.attributes.get("unit_of_measurement") or self.default_unit
-        return value * UNIT_FACTORS.get(unit, UNIT_FACTORS[self.default_unit])
+    def _length(self, state) -> float | None:
+        return to_meters(state.state, state.attributes.get("unit_of_measurement"), self.p["length_unit"]) if state else None
+
+    def _energy(self) -> float | None:
+        st = self._state(self.p.get("energy_entity"))
+        return to_kwh(st.state, st.attributes.get("unit_of_measurement")) if st else None
+
+    def _percent(self) -> float | None:
+        st = self._state(self.p.get("progress_entity"))
+        return to_percent(st.state, st.attributes.get("unit_of_measurement")) if st else None
+
+    def _remaining(self) -> float | None:
+        st = self._state(self.p.get("remaining_entity"))
+        return to_seconds(st.state, st.attributes.get("unit_of_measurement")) if st else None
 
     def _begin(self) -> None:
-        fst = self.hass.states.get(self.file_id) if self.file_id else None
-        lst = self.hass.states.get(self.fil_id) if self.fil_id else None
+        fst = self._state(self.p.get("filename_entity"))
         self.session = {
             "started_at": _iso(datetime.now(timezone.utc)),
-            "filename": fst.state if fst and fst.state not in _BAD else "",
-            "length_m": self._length_m(lst) or 0.0,
+            "filename": fst.state if fst and fst.state not in ("unknown", "unavailable") else "",
+            "length_m": self._length(self._state(self.p.get("filament_entity"))) or 0.0,
+            "energy_start": self._energy(), "percent": 0.0,
         }
-        self._persist()
+        self._persist(force=True)
+        self.hass.async_create_task(self._notify_progress(force=True))
+
+    async def _notify_progress(self, force: bool = False) -> None:
+        if not self.session or not self.data.notifier:
+            return
+        pct = self._percent()
+        if pct is not None:
+            self.session["percent"] = pct
+        await self.data.notifier.progress(self.p, pretty_name(self.session["filename"]), self.session["percent"],
+                                          self._remaining(), force=force)
 
     @callback
     def _handle(self, event: Event) -> None:
-        entity = event.data["entity_id"]
-        new = event.data.get("new_state")
+        entity, new = event.data["entity_id"], event.data.get("new_state")
         if new is None:
             return
-        if entity == self.fil_id and self.session:
-            length = self._length_m(new)
+        if entity == self.p.get("state_entity"):
+            mapped = map_state(new.state, self.p["state_map"])
+            if mapped == "printing" and not self.session:
+                self._begin()
+            elif self.session and mapped in END_STATUS:
+                self.hass.async_create_task(self._finish(END_STATUS[mapped]))
+            elif self.session and mapped == "paused":
+                self.hass.async_create_task(self._notify_progress(force=True))
+        elif not self.session:
+            return
+        elif entity == self.p.get("filament_entity"):
+            length = self._length(new)
             if length is not None and length > self.session["length_m"]:
                 self.session["length_m"] = length
                 self._persist()
-        elif entity == self.file_id and self.session and new.state not in _BAD:
+        elif entity == self.p.get("filename_entity") and new.state not in ("unknown", "unavailable", ""):
             self.session["filename"] = new.state
-            self._persist()
-        elif entity == self.state_id:
-            state = (new.state or "").lower()
-            if state == "printing" and not self.session:
-                self._begin()
-            elif self.session and (state in END_STATES or state == "standby"):
-                self.hass.async_create_task(self._finish(END_STATES.get(state, "cancelled")))
+            self._persist(force=True)
+        elif entity in (self.p.get("progress_entity"), self.p.get("remaining_entity")):
+            self.hass.async_create_task(self._notify_progress())
 
     async def _finish(self, status: str) -> None:
         session, self.session = self.session, None
         if not session:
             return
-        await self.hass.async_add_executor_job(self.data.store.set_setting, "session", None)
-        ended = datetime.now(timezone.utc)
-        store = self.data.store
+        store, ended = self.data.store, datetime.now(timezone.utc)
+        await self.hass.async_add_executor_job(store.set_setting, self.key, None)
+        kwh = None
+        end_energy = self._energy()
+        if session.get("energy_start") is not None and end_energy is not None and end_energy >= session["energy_start"]:
+            kwh = round(end_energy - session["energy_start"], 4)
+        percent = 100.0 if status == "complete" else session.get("percent", 0.0)
 
         def _create():
-            s = store.get_settings()
-            return store.add_print({
-                "filename": session["filename"], "status": status, "source": "auto",
-                "started_at": session["started_at"], "ended_at": _iso(ended),
-                "length_m": round(session["length_m"], 3), "length_auto_m": round(session["length_m"], 3),
-                "person_id": s.get("current_person_id"), "role_id": s.get("current_role_id"),
-                "filament_id": s.get("current_filament_id"),
-            })
+            settings = store.get_settings()
+            printer = next((r for r in store.list_table("printers") if r["id"] == self.p["id"]), self.p)
+            row = {"filename": session["filename"], "status": status, "source": "auto", "printer_id": self.p["id"],
+                   "started_at": session["started_at"], "ended_at": _iso(ended),
+                   "length_m": round(session["length_m"], 3), "length_auto_m": round(session["length_m"], 3),
+                   "person_id": printer.get("current_person_id"), "role_id": printer.get("current_role_id"),
+                   "filament_id": printer.get("current_filament_id"), "energy_kwh": kwh}
+            price = None
+            if kwh is not None:
+                ent = settings.get("energy_price_entity")
+                est = self.hass.states.get(ent) if ent else None
+                value = to_float(est.state) if est else None
+                price = int(round(value * 1_000_000)) if value is not None else settings.get("energy_price_micro", 0)
+                row["energy_price_micro"] = price
+            return store.add_print(row)
 
         try:
             row = await self.hass.async_add_executor_job(_create)
@@ -113,5 +148,30 @@ class PrintTracker:
             _LOGGER.exception("Could not log print")
             return
         self.hass.bus.async_fire(EVENT_PRINT_FINISHED, {"id": row["id"], "filename": row["filename"], "status": status,
-                                                         "incomplete": row["incomplete"]})
+                                                         "printer": self.p["name"], "incomplete": row["incomplete"]})
         await self.data.async_refresh()
+        if self.data.notifier:
+            await self.data.notifier.finished(self.p, status, {
+                "filename": pretty_name(row["filename"]), "percent": int(percent), "length": round(row["length_m"], 1),
+                "cost": f"EUR {row['total_cost']:.2f}", "person": row["person"], "filament": row["filament"]})
+
+
+class PrinterManager:
+    def __init__(self, hass: HomeAssistant, data: PrintLogData) -> None:
+        self.hass, self.data = hass, data
+        self.trackers: dict[int, PrinterTracker] = {}
+
+    async def async_reload(self) -> None:
+        self.async_stop()
+        printers = await self.hass.async_add_executor_job(self.data.store.list_table, "printers", False)
+        for p in printers:
+            if not p.get("state_entity"):
+                continue
+            tracker = PrinterTracker(self.hass, self.data, p)
+            await tracker.async_start()
+            self.trackers[p["id"]] = tracker
+
+    def async_stop(self) -> None:
+        for t in self.trackers.values():
+            t.async_stop()
+        self.trackers.clear()

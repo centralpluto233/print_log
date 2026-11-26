@@ -3,24 +3,16 @@
     "step": {
       "user": {
         "title": "Print Log",
-        "description": "Kies de Moonraker-entiteiten.",
+        "description": "Stel je eerste printer in. Je kunt later printers toevoegen en wijzigen in het Print log-paneel (tabblad Printers).",
         "data": {
-          "state_entity": "Print state",
-          "filename_entity": "Bestandsnaam",
-          "filament_entity": "Filament gebruikt",
-          "length_unit": "Eenheid (als de sensor er geen heeft)"
-        }
-      }
-    }
-  },
-  "options": {
-    "step": {
-      "init": {
-        "data": {
-          "state_entity": "Print state",
-          "filename_entity": "Bestandsnaam",
-          "filament_entity": "Filament gebruikt",
-          "length_unit": "Eenheid (als de sensor er geen heeft)"
+          "name": "Naam van de printer",
+          "state_entity": "Print state (verplicht)",
+          "filename_entity": "Bestandsnaam (optioneel)",
+          "filament_entity": "Filament gebruikt (optioneel)",
+          "length_unit": "Eenheid als de sensor er geen heeft",
+          "progress_entity": "Voortgang in % (optioneel)",
+          "remaining_entity": "Resterende tijd (optioneel)",
+          "energy_entity": "Energieteller kWh of Wh, bv. Shelly (optioneel)"
         }
       }
     }
