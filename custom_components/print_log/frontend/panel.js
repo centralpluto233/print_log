@@ -25,6 +25,8 @@ th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--divider-colo
 th{font-weight:500;color:var(--secondary-text-color);white-space:nowrap}th[data-sort]{cursor:pointer}
 td.n,th.n{text-align:right}.tot{display:flex;gap:24px;flex-wrap:wrap}.tot b{font-size:20px;display:block}
 .badge{font-size:11px;padding:1px 6px;border-radius:8px;background:var(--warning-color,#fa0);color:#000}
+.swatch{display:inline-block;width:12px;height:12px;border-radius:50%;border:1px solid var(--divider-color);vertical-align:middle;margin-right:6px}
+.ok{color:var(--success-color,#2e7d32)}
 .st-cancelled,.st-error{color:var(--error-color,#c00)}.muted{color:var(--secondary-text-color)}.err{color:var(--error-color,#c00);font-size:13px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:10;overflow:auto}
 .modal form{background:var(--card-background-color,#fff);padding:20px;border-radius:12px;min-width:320px;max-width:95vw;max-height:95vh;overflow:auto;display:grid;gap:10px}
@@ -39,6 +41,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<
 const dur = (s) => (s == null ? "" : `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`);
 const localInput = (iso) => { if (!iso) return ""; const d = new Date(iso); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 16); };
 const fromLocalInput = (v) => (v ? new Date(v).toISOString().replace(/\.\d+Z$/, "Z") : null);
+const safeHex = (v) => (/^#[0-9a-fA-F]{3,8}$/.test(String(v || "").trim()) ? String(v).trim() : "");
 const PREF_KEY = "print_log";
 
 class PrintLogPanel extends HTMLElement {
@@ -48,6 +51,7 @@ class PrintLogPanel extends HTMLElement {
     this.tab = "prints"; this.filters = {}; this.sort = "ended_at"; this.order = "desc"; this.page = 0; this.group = "person";
     this.lists = {people: [], roles: [], filaments: [], printers: []}; this.settings = {};
     this.prefs = {theme: "auto", lang: "auto", size: 25}; this.printerId = null;
+    this.settle = {person: "", period: "", final: null};
     this.t = makeT("en");
   }
   set hass(h) { const first = !this._hass; this._hass = h; if (first) this.init(); }
@@ -90,12 +94,15 @@ class PrintLogPanel extends HTMLElement {
       items.map((x) => `<option value="${x.id}" ${x.id == sel ? "selected" : ""}>${esc(x.name)}${x.archived ? " (" + this.t("archived").toLowerCase() + ")" : ""}</option>`).join("");
   }
   stLabel(s) { return this.t("s_" + s) || s; }
-  money(v) { return new Intl.NumberFormat(this._hass?.locale?.language || this.lang, {style: "currency", currency: "EUR", minimumFractionDigits: 2, maximumFractionDigits: 3}).format(v || 0); }
-  dt(iso) { return iso ? new Date(iso).toLocaleString(this._hass?.locale?.language || this.lang, {dateStyle: "short", timeStyle: "short"}) : ""; }
+  get loc() { return this._hass?.locale?.language || this.lang; }
+  money(v) { return new Intl.NumberFormat(this.loc, {style: "currency", currency: "EUR", minimumFractionDigits: 2, maximumFractionDigits: 3}).format(v || 0); }
+  moneyP(v) { return new Intl.NumberFormat(this.loc, {style: "currency", currency: "EUR", minimumFractionDigits: 2, maximumFractionDigits: 4}).format(v || 0); }
+  dt(iso) { return iso ? new Date(iso).toLocaleString(this.loc, {dateStyle: "short", timeStyle: "short"}) : ""; }
+  dday(iso) { return iso ? new Date(iso).toLocaleDateString(this.loc, {dateStyle: "short"}) : ""; }
 
   async render() {
     const t = this.t, root = this.shadowRoot.getElementById("root");
-    const tabs = ["prints", "stats", "people", "filaments", "roles", "printers", "settings"];
+    const tabs = ["prints", "settlements", "stats", "people", "filaments", "roles", "printers", "settings"];
     root.innerHTML = `<div class="head"><h1>${t("title")}</h1>
       <button class="sec tiny" id="theme" title="${t("theme")}">${{auto: "◐", light: "☀", dark: "☾"}[this.prefs.theme] || "◐"}</button></div>${this.currentBar()}
       <div class="tabs">${tabs.map((k) => `<div class="tab ${k === this.tab ? "on" : ""}" data-tab="${k}">${t("t_" + k)}</div>`).join("")}</div><div id="content"></div>
@@ -106,6 +113,7 @@ class PrintLogPanel extends HTMLElement {
     const c = root.querySelector("#content");
     try {
       if (this.tab === "prints") await this.viewPrints(c);
+      else if (this.tab === "settlements") await this.viewSettlements(c);
       else if (this.tab === "stats") await this.viewStats(c);
       else if (this.tab === "settings") this.viewSettings(c);
       else if (this.tab === "printers") this.viewPrinters(c);
@@ -147,25 +155,32 @@ class PrintLogPanel extends HTMLElement {
       ${sel("filament", t("filament"), this.opts("filaments", f.filament, {empty: null, archived: true}))}
       ${multi ? sel("printer", t("printer"), this.opts("printers", f.printer, {empty: null, archived: true})) : ""}
       ${sel("status", t("status"), ["complete", "cancelled", "error"].map((k) => `<option value="${k}" ${f.status === k ? "selected" : ""}>${this.stLabel(k)}</option>`).join(""))}
+      ${sel("paid", t("paid"), ["yes", "no"].map((k) => `<option value="${k}" ${f.paid === k ? "selected" : ""}>${t(k === "yes" ? "paid" : "unpaid")}</option>`).join(""))}
       <label>${t("from")}<input type="date" name="from" value="${esc(f.from)}"></label><label>${t("to")}<input type="date" name="to" value="${esc(f.to)}"></label>
       <label>${t("min_dur")}<input type="number" name="min_duration" min="0" value="${esc(f.min_duration)}" style="width:90px"></label>
       <label>${t("max_dur")}<input type="number" name="max_duration" min="0" value="${esc(f.max_duration)}" style="width:90px"></label>
       <label>${t("search")}<input type="search" name="q" value="${esc(f.q)}"></label><button class="sec" id="reset">${t("reset")}</button></div>
       <div class="card tot"><div><span class="muted">${t("t_prints")}</span><b>${res.total}</b></div>
         <div><span class="muted">${t("total_cost")}</span><b>${this.money(res.total_cost)}</b></div>
+        <div><span class="muted">${t("total_price")}</span><b>${this.money(res.total_price)}</b></div>
+        <div><span class="muted">${t("total_profit")}</span><b>${this.money(res.total_profit)}</b></div>
+        <div><span class="muted">${t("total_unpaid")}</span><b>${this.money(res.total_unpaid)}</b></div>
         <div><span class="muted">${t("total_filament")}</span><b>${res.total_length_m.toFixed(1)} m</b></div>
         <div><span class="muted">${t("total_energy")}</span><b>${res.total_energy_kwh.toFixed(2)} kWh</b></div>
-        <div style="margin-left:auto;display:flex;gap:8px;align-items:center"><button class="sec" id="csv">${t("csv")}</button>${this.admin ? `<button id="add">${t("add_print")}</button>` : ""}</div></div>
-      <div class="card" style="overflow:auto"><table><thead><tr>${th("ended_at", t("end"))}${th("filename", t("file"))}${th("person", t("person"))}${th("role", t("role"))}
+        <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="sec" id="csv">${t("csv")}</button>
+          ${this.admin ? `<button class="sec" id="bpaid">${t("mark_paid")}</button><button class="sec" id="bunpaid">${t("mark_unpaid")}</button><button id="add">${t("add_print")}</button>` : ""}</div></div>
+      <div class="card" style="overflow:auto"><table><thead><tr>${this.admin ? '<th><input type="checkbox" id="selall"></th>' : ""}${th("ended_at", t("end"))}${th("filename", t("file"))}${th("person", t("person"))}${th("role", t("role"))}
         ${th("filament", t("filament"))}${multi ? th("printer", t("printer")) : ""}${th("duration_s", t("duration"), 1)}${th("length_m", t("meters"), 1)}${th("energy_kwh", t("energy"), 1)}
-        ${th("total_cost", t("cost"), 1)}${th("status", t("status"))}<th></th></tr></thead><tbody>
-        ${res.items.map((p) => `<tr><td>${this.dt(p.ended_at)}</td><td>${esc(p.filename) || '<span class="muted">-</span>'}</td>
+        ${th("total_cost", t("cost"), 1)}${th("price", t("price"), 1)}${th("profit", t("profit"), 1)}${th("paid_at", t("paid"))}${th("status", t("status"))}<th></th></tr></thead><tbody>
+        ${res.items.map((p) => `<tr>${this.admin ? `<td><input type="checkbox" data-sel="${p.id}"></td>` : ""}<td>${this.dt(p.ended_at)}</td><td>${esc(p.filename) || '<span class="muted">-</span>'}</td>
           <td>${esc(p.person) || `<span class="badge">${t("pick")}</span>`}</td><td>${esc(p.role)}</td><td>${esc(p.filament) || `<span class="badge">${t("pick")}</span>`}</td>
           ${multi ? `<td>${esc(p.printer)}</td>` : ""}<td class="n">${dur(p.duration_s)}</td><td class="n">${p.length_m.toFixed(2)}</td>
           <td class="n">${p.energy_kwh == null ? "" : p.energy_kwh.toFixed(2) + " kWh"}</td><td class="n">${this.money(p.total_cost)}</td>
+          <td class="n">${this.money(p.price)}${p.sale_price != null ? " ✎" : ""}</td><td class="n">${this.money(p.profit)}</td>
+          <td>${p.paid ? `<span class="ok">✓ ${this.dday(p.paid_at)}</span>` : ""}</td>
           <td class="st-${p.status}">${this.stLabel(p.status)}</td>
           <td>${this.admin ? `<button class="tiny sec" data-edit="${p.id}">✎</button> <button class="tiny danger" data-del="${p.id}">✕</button>` : ""}</td></tr>`).join("") ||
-          `<tr><td colspan="12" class="muted">${t("no_prints")}</td></tr>`}</tbody></table>
+          `<tr><td colspan="16" class="muted">${t("no_prints")}</td></tr>`}</tbody></table>
         <div class="pager"><button class="sec tiny" id="prev" ${this.page <= 0 ? "disabled" : ""}>←</button><span>${this.page + 1} / ${pages}</span>
         <button class="sec tiny" id="next" ${this.page + 1 >= pages ? "disabled" : ""}>→</button></div></div>`;
     c.querySelectorAll("#filters select,#filters input").forEach((el) => (el.onchange = () => { this.filters[el.name] = el.value; this.page = 0; this.render(); }));
@@ -175,6 +190,14 @@ class PrintLogPanel extends HTMLElement {
     c.querySelector("#next").onclick = () => { this.page++; this.render(); };
     c.querySelector("#csv").onclick = () => this.exportCsv();
     c.querySelector("#add")?.addEventListener("click", () => this.printForm(null));
+    c.querySelector("#selall")?.addEventListener("change", (e) => c.querySelectorAll("input[data-sel]").forEach((x) => (x.checked = e.target.checked)));
+    const bulk = (paid) => async () => {
+      const ids = [...c.querySelectorAll("input[data-sel]:checked")].map((x) => parseInt(x.dataset.sel));
+      if (!ids.length) { alert(t("select_none")); return; }
+      try { await this.api("POST", "paid", {ids, paid}); this.render(); } catch (e) { alert(e.message); }
+    };
+    c.querySelector("#bpaid")?.addEventListener("click", bulk(true));
+    c.querySelector("#bunpaid")?.addEventListener("click", bulk(false));
     c.querySelectorAll("[data-edit]").forEach((b) => (b.onclick = () => this.printForm(res.items.find((p) => p.id == b.dataset.edit))));
     c.querySelectorAll("[data-del]").forEach((b) => (b.onclick = async () => {
       if (!confirm(t("del_print"))) return;
@@ -198,7 +221,7 @@ class PrintLogPanel extends HTMLElement {
     };
   }
   printForm(p) {
-    const t = this.t, cp = this.printer || {};
+    const t = this.t, cp = this.printer || {}, locked = !!(p && p.settlement_id);
     const n = p || {status: "complete", length_m: 0, ended_at: new Date().toISOString(), person_id: cp.current_person_id, role_id: cp.current_role_id, filament_id: cp.current_filament_id, printer_id: cp.id};
     this.modal(`<h3>${p ? t("edit_print") : t("new_print")}</h3>
       <label>${t("filename")}<input name="filename" value="${esc(n.filename)}"></label>
@@ -209,6 +232,9 @@ class PrintLogPanel extends HTMLElement {
       <label>${t("length_m")}<input name="length_m" type="number" step="0.001" min="0" value="${n.length_m}" required></label>
       ${p && p.length_auto_m != null && p.length_auto_m !== p.length_m ? `<span class="muted">${t("auto_counted", {n: p.length_auto_m})}</span>` : ""}
       <label>${t("kwh")}<input name="energy_kwh" type="number" step="0.001" min="0" value="${n.energy_kwh ?? ""}"></label>
+      <label>${t("sale_price")}<input name="sale_price" type="number" step="0.01" min="0" value="${n.sale_price ?? ""}"></label>
+      <label class="chk"><input type="checkbox" name="paid" ${n.paid ? "checked" : ""} ${locked ? "disabled" : ""}> ${t("paid_chk")}</label>
+      ${locked ? `<span class="muted">${t("in_settlement")}</span>` : ""}
       <label>${t("status")}<select name="status">${["complete", "cancelled", "error"].map((k) => `<option value="${k}" ${n.status === k ? "selected" : ""}>${this.stLabel(k)}</option>`).join("")}</select></label>
       <label>${t("started")}<input name="started_at" type="datetime-local" value="${localInput(n.started_at)}"></label>
       <label>${t("ended")}<input name="ended_at" type="datetime-local" value="${localInput(n.ended_at)}"></label>
@@ -217,18 +243,27 @@ class PrintLogPanel extends HTMLElement {
       async (d) => {
         const body = {filename: d.filename, printer_id: d.printer_id || null, person_id: d.person_id || null, role_id: d.role_id || null,
           filament_id: d.filament_id || null, length_m: parseFloat(d.length_m), energy_kwh: d.energy_kwh === "" ? null : parseFloat(d.energy_kwh),
-          status: d.status, started_at: fromLocalInput(d.started_at), ended_at: fromLocalInput(d.ended_at), notes: d.notes || null};
+          sale_price: d.sale_price ?? "", status: d.status, started_at: fromLocalInput(d.started_at), ended_at: fromLocalInput(d.ended_at), notes: d.notes || null};
+        if (!locked) body.paid = d.paid === "on";
         if (p) await this.api("PUT", "prints/" + p.id, body); else await this.api("POST", "prints", body);
       });
   }
 
   entitySpec(table) {
-    const t = this.t;
+    const t = this.t, pct = (v) => (v == null ? "" : `${v} %`);
     return {
-      people: {title: t("people_t"), fields: [{k: "name", label: t("name"), type: "text", req: true}, {k: "default_role_id", label: t("default_role"), type: "select", from: "roles", empty: t("none")}]},
-      roles: {title: t("roles_t"), fields: [{k: "name", label: t("name"), type: "text", req: true}]},
-      filaments: {title: t("filaments_t"), fields: [{k: "name", label: t("name"), type: "text", req: true}, {k: "material", label: t("material"), type: "text"},
-        {k: "price_per_m", label: t("price_m"), type: "number", step: "0.0001", req: true}]},
+      people: {title: t("people_t"), fields: [{k: "name", label: t("name"), type: "text", req: true},
+        {k: "default_role_id", label: t("default_role"), type: "select", from: "roles", empty: t("none")},
+        {k: "modifier_pct", label: t("own_margin"), col: t("margin"), type: "number", step: "0.1", fmt: (r) => pct(r.modifier_pct)}], hint: t("margin_hint")},
+      roles: {title: t("roles_t"), fields: [{k: "name", label: t("name"), type: "text", req: true},
+        {k: "modifier_pct", label: t("margin"), type: "number", step: "0.1", req: true, fmt: (r) => pct(r.modifier_pct)}], hint: t("margin_hint")},
+      filaments: {title: t("filaments_t"), fields: [{k: "name", label: t("name"), type: "text", req: true},
+        {k: "material", label: t("kind"), col: t("kind"), type: "text"}, {k: "brand", label: t("brand"), type: "text"},
+        {k: "color", label: t("color"), type: "text", fmt: (r) => `${safeHex(r.color_hex) ? `<span class="swatch" style="background:${safeHex(r.color_hex)}"></span>` : ""}${esc(r.color)}`},
+        {k: "color_hex", label: t("color_hex"), type: "text", hide: true},
+        {k: "price_per_m", label: t("price_m"), type: "number", step: "0.000001", req: true, fmt: (r) => this.moneyP(r.price_per_m)},
+        {k: "stock_m", label: t("stock_m"), col: t("remaining"), type: "number", step: "0.1", valueKey: "remaining_m",
+          fmt: (r) => (r.remaining_m == null ? "" : `${r.remaining_m} m${r.low_stock ? ` <span class="badge">${t("low_stock")}</span>` : ""}`)}], hint: t("stock_hint")},
     }[table];
   }
   tableCard(title, headers, rowsHtml, addBtn) {
@@ -246,21 +281,22 @@ class PrintLogPanel extends HTMLElement {
     }));
   }
   viewEntity(c, table) {
-    const t = this.t, spec = this.entitySpec(table), rows = this.lists[table];
-    const cell = (r, f) => f.type === "select" ? esc(this.lists[f.from].find((x) => x.id == r[f.k])?.name || "") : esc(r[f.k]);
-    c.innerHTML = this.tableCard(spec.title, [...spec.fields.map((f) => f.label), t("prints_n"), ""],
-      rows.map((r) => `<tr class="${r.archived ? "muted" : ""}">${spec.fields.map((f) => `<td>${cell(r, f)}${f.k === "name" && r.archived ? " (" + t("archived").toLowerCase() + ")" : ""}</td>`).join("")}<td>${r.print_count}</td><td>${this.actions(r)}</td></tr>`).join(""), true);
+    const t = this.t, spec = this.entitySpec(table), rows = this.lists[table], shown = spec.fields.filter((f) => !f.hide);
+    const cell = (r, f) => f.fmt ? f.fmt(r) : f.type === "select" ? esc(this.lists[f.from].find((x) => x.id == r[f.k])?.name || "") : esc(r[f.k]);
+    c.innerHTML = this.tableCard(spec.title, [...shown.map((f) => f.col || f.label), t("prints_n"), ""],
+      rows.map((r) => `<tr class="${r.archived ? "muted" : ""}">${shown.map((f) => `<td>${cell(r, f)}${f.k === "name" && r.archived ? " (" + t("archived").toLowerCase() + ")" : ""}</td>`).join("")}<td>${r.print_count}</td><td>${this.actions(r)}</td></tr>`).join(""), true);
     this.bindActions(c, table, rows, (item) => this.entityForm(table, item));
   }
   entityForm(table, item) {
     const t = this.t, spec = this.entitySpec(table), n = item || {};
     const input = (f) => f.type === "select" ? `<select name="${f.k}">${this.opts(f.from, n[f.k], {empty: f.empty})}</select>`
-      : `<input name="${f.k}" type="${f.type}" ${f.step ? `step="${f.step}"` : ""} value="${esc(n[f.k])}" ${f.req ? "required" : ""}>`;
+      : `<input name="${f.k}" type="${f.type}" ${f.step ? `step="${f.step}"` : ""} value="${esc(n[f.valueKey || f.k])}" ${f.req ? "required" : ""}>`;
     this.modal(`<h3>${spec.title}</h3>${spec.fields.map((f) => `<label>${f.label}${input(f)}</label>`).join("")}
+      ${spec.hint ? `<span class="muted">${spec.hint}</span>` : ""}
       ${item ? `<label class="chk"><input type="checkbox" name="archived" ${n.archived ? "checked" : ""}> ${t("archived")}</label>` : ""}`,
       async (d) => {
         const body = {};
-        for (const f of spec.fields) body[f.k] = f.type === "number" ? parseFloat(d[f.k]) : f.type === "select" ? (d[f.k] || null) : d[f.k];
+        for (const f of spec.fields) body[f.k] = f.type === "number" ? (d[f.k] === "" ? null : parseFloat(d[f.k])) : f.type === "select" ? (d[f.k] || null) : d[f.k];
         if (item) body.archived = d.archived === "on";
         if (item) await this.api("PUT", `${table}/${item.id}`, body); else await this.api("POST", table, body);
       });
@@ -289,22 +325,72 @@ class PrintLogPanel extends HTMLElement {
       });
   }
 
+  async viewSettlements(c) {
+    const t = this.t, S = this.settle, people = this.lists.people.filter((p) => !p.archived || p.id == S.person);
+    let pv = null, open = [];
+    if (S.person) {
+      pv = await this.api("GET", `settlement_preview?person=${S.person}${S.period ? `&period=${S.period}` : ""}`);
+      if (pv.prints) {
+        const q = new URLSearchParams({person: S.person, paid: "no", limit: "1000", sort: "ended_at", order: "asc"});
+        if (S.period) { const [y, m] = S.period.split("-").map(Number); q.set("from", `${S.period}-01`); q.set("to", `${S.period}-${String(new Date(y, m, 0).getDate()).padStart(2, "0")}`); }
+        open = (await this.api("GET", `prints?${q}`)).items;
+      }
+    }
+    const hist = await this.api("GET", `settlements${S.person ? `?person=${S.person}` : ""}`);
+    const sign = (v) => (v > 0 ? "+" : "") + this.moneyP(v);
+    const final0 = pv ? (S.final ?? pv.suggestions.cent) : 0;
+    c.innerHTML = `<div class="card bar"><label>${t("person")}<select id="s_person"><option value="">${t("choose")}</option>${people.map((p) => `<option value="${p.id}" ${p.id == S.person ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>
+      <label>${t("period")}<input type="month" id="s_period" value="${esc(S.period)}"></label></div>
+      ${!pv ? `<div class="card muted">${t("pick_person")}</div>` : !pv.prints ? `<div class="card muted">${t("settle_none")}</div>` : `<div class="card">
+        <div class="tot"><div><span class="muted">${t("open_prints")}</span><b>${pv.prints}</b></div><div><span class="muted">${t("calculated")}</span><b>${this.moneyP(pv.calculated)}</b></div>
+          <div><span class="muted">${t("profit")}</span><b>${this.moneyP(pv.profit)}</b></div></div>
+        ${this.admin ? `<div class="bar" style="margin-top:10px"><button class="sec" data-r="cent">${t("round_cent")}</button><button class="sec" data-r="50c">${t("round_50")}</button><button class="sec" data-r="euro">${t("round_euro")}</button>
+          <label>${t("final_amount")}<input type="number" step="0.01" min="0" id="s_final" value="${Number(final0).toFixed(2)}"></label>
+          <span>${t("difference")}: <b id="s_diff"></b></span>
+          <label>${t("notes")}<input id="s_note"></label><button id="s_go">${t("settle_btn")}</button></div>` : ""}
+        <table style="margin-top:10px"><thead><tr><th>${t("end")}</th><th>${t("file")}</th><th>${t("filament")}</th><th class="n">${t("price")}</th></tr></thead><tbody>
+        ${open.map((p) => `<tr><td>${this.dt(p.ended_at)}</td><td>${esc(p.filename)}</td><td>${esc(p.filament)}</td><td class="n">${this.moneyP(p.price)}</td></tr>`).join("")}</tbody></table></div>`}
+      <div class="card" style="overflow:auto"><h3>${t("history")}</h3>${hist.length ? `<table><thead><tr><th>${t("date")}</th><th>${t("person")}</th><th>${t("period").split(" (")[0]}</th><th class="n">${t("t_prints")}</th><th class="n">${t("calculated")}</th><th class="n">${t("final_amount")}</th><th class="n">${t("difference")}</th><th>${t("notes")}</th><th></th></tr></thead><tbody>
+        ${hist.map((h) => `<tr><td>${this.dt(h.created_at)}</td><td>${esc(h.person)}</td><td>${esc(h.period || t("period_all"))}</td><td class="n">${h.prints_count}</td><td class="n">${this.moneyP(h.calculated)}</td><td class="n">${this.moneyP(h.final)}</td><td class="n">${sign(h.diff)}</td><td>${esc(h.note)}</td><td>${this.admin ? `<button class="tiny sec" data-undo="${h.id}">${t("undo")}</button>` : ""}</td></tr>`).join("")}</tbody></table>` : `<span class="muted">${t("no_settlements")}</span>`}</div>`;
+    c.querySelector("#s_person").onchange = (e) => { S.person = e.target.value; S.final = null; this.render(); };
+    c.querySelector("#s_period").onchange = (e) => { S.period = e.target.value; S.final = null; this.render(); };
+    const fin = c.querySelector("#s_final"), diff = c.querySelector("#s_diff");
+    const upd = () => { if (fin && diff && pv) diff.textContent = sign((parseFloat(fin.value) || 0) - pv.calculated); };
+    if (fin) {
+      upd(); fin.oninput = () => { S.final = parseFloat(fin.value); upd(); };
+      c.querySelectorAll("[data-r]").forEach((b) => (b.onclick = () => { fin.value = Number(pv.suggestions[b.dataset.r]).toFixed(2); S.final = parseFloat(fin.value); upd(); }));
+      c.querySelector("#s_go").onclick = async () => {
+        const final = parseFloat(fin.value);
+        if (isNaN(final) || final < 0) { alert(t("final_amount")); return; }
+        try {
+          await this.api("POST", "settlements", {person_id: parseInt(S.person), print_ids: pv.print_ids, final, note: c.querySelector("#s_note").value, period: S.period || null});
+          S.final = null; alert(t("settle_done")); this.render();
+        } catch (e) { alert(e.message); }
+      };
+    }
+    c.querySelectorAll("[data-undo]").forEach((b) => (b.onclick = async () => {
+      if (!confirm(t("undo_confirm"))) return;
+      try { await this.api("DELETE", "settlements/" + b.dataset.undo); this.render(); } catch (e) { alert(e.message); }
+    }));
+  }
+
   async viewStats(c) {
     const t = this.t, rows = await this.api("GET", `stats?${this.qs({group_by: this.group})}`);
     const groups = ["person", "role", "filament", "printer", "month", "status"];
     c.innerHTML = `<div class="card bar">${groups.map((k) => `<button class="${k === this.group ? "" : "sec"}" data-g="${k}">${t("g_" + k)}</button>`).join("")}<span class="muted">${t("filters_apply")}</span></div>
       <div class="card"><b>${t("chart_cost")}</b>${this.bars(rows, "total_cost", (v) => this.money(v))}</div>
+      <div class="card"><b>${t("chart_profit")}</b>${this.bars(rows, "profit", (v) => this.money(v))}</div>
       <div class="card"><b>${t("chart_len")}</b>${this.bars(rows, "length_m", (v) => v.toFixed(1) + " m")}</div>
-      <div class="card" style="overflow:auto"><table><thead><tr><th>${t("g_" + this.group)}</th><th class="n">${t("t_prints")}</th><th class="n">${t("meters")}</th><th class="n">${t("duration")}</th><th class="n">${t("energy")}</th><th class="n">${t("cost")}</th></tr></thead><tbody>
-      ${rows.map((r) => `<tr><td>${esc(r.key)}</td><td class="n">${r.prints}</td><td class="n">${r.length_m.toFixed(1)}</td><td class="n">${dur(r.duration_s)}</td><td class="n">${r.energy_kwh.toFixed(2)} kWh</td><td class="n">${this.money(r.total_cost)}</td></tr>`).join("")}</tbody></table></div>`;
+      <div class="card" style="overflow:auto"><table><thead><tr><th>${t("g_" + this.group)}</th><th class="n">${t("t_prints")}</th><th class="n">${t("meters")}</th><th class="n">${t("duration")}</th><th class="n">${t("energy")}</th><th class="n">${t("cost")}</th><th class="n">${t("profit")}</th><th class="n">${t("unpaid")}</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr><td>${esc(r.key)}</td><td class="n">${r.prints}</td><td class="n">${r.length_m.toFixed(1)}</td><td class="n">${dur(r.duration_s)}</td><td class="n">${r.energy_kwh.toFixed(2)} kWh</td><td class="n">${this.money(r.total_cost)}</td><td class="n">${this.money(r.profit)}</td><td class="n">${this.money(r.unpaid)}</td></tr>`).join("")}</tbody></table></div>`;
     c.querySelectorAll("[data-g]").forEach((b) => (b.onclick = () => { this.group = b.dataset.g; this.render(); }));
   }
   bars(rows, key, fmt) {
     if (!rows.length) return `<div class="muted">${this.t("no_data")}</div>`;
-    const max = Math.max(...rows.map((r) => r[key]), 1e-9), h = 26, lw = 130, w = 700;
+    const max = Math.max(...rows.map((r) => Math.abs(r[key])), 1e-9), h = 26, lw = 130, w = 700;
     return `<svg viewBox="0 0 ${w + 140} ${rows.length * h + 6}" width="100%">${rows.map((r, i) => {
-      const bw = Math.max(1, (r[key] / max) * w * 0.8);
-      return `<text x="0" y="${i * h + 17}">${esc(String(r.key).slice(0, 20))}</text><rect x="${lw}" y="${i * h + 4}" width="${bw}" height="${h - 8}" rx="3" fill="var(--primary-color)"/>
+      const bw = Math.max(1, (Math.abs(r[key]) / max) * w * 0.8);
+      return `<text x="0" y="${i * h + 17}">${esc(String(r.key).slice(0, 20))}</text><rect x="${lw}" y="${i * h + 4}" width="${bw}" height="${h - 8}" rx="3" fill="${r[key] < 0 ? "var(--error-color,#c00)" : "var(--primary-color)"}"/>
         <text x="${lw + bw + 6}" y="${i * h + 17}">${esc(fmt(r[key]))}</text>`; }).join("")}</svg>`;
   }
 
@@ -322,7 +408,8 @@ class PrintLogPanel extends HTMLElement {
       <form id="sform"><div class="card"><h3>${t("costs")}</h3>${this.admin ? "" : `<div class="muted">${t("admin_only")}</div>`}<div class="grid">
         <label>${t("failed_pct")}<input name="failed_cost_pct" type="number" min="0" max="100" value="${s.failed_cost_pct ?? 100}" ${dis}></label>
         <label>${t("energy_price")}<input name="energy_price" type="number" min="0" step="0.0001" value="${(s.energy_price_micro || 0) / 1e6}" ${dis}></label>
-        <label>${t("energy_price_entity")}<input name="energy_price_entity" list="ents" value="${esc(s.energy_price_entity)}" ${dis} autocomplete="off"></label></div>
+        <label>${t("energy_price_entity")}<input name="energy_price_entity" list="ents" value="${esc(s.energy_price_entity)}" ${dis} autocomplete="off"></label>
+        <label>${t("low_stock_m")}<input name="low_stock_m" type="number" min="0" value="${s.low_stock_m ?? 50}" ${dis}></label></div>
         <p class="muted">${t("energy_hint")}</p></div>
       <div class="card"><h3>${t("notif")}</h3><div class="grid">${chk("enabled", "n_enabled")}${chk("progress", "n_progress")}${chk("live_update", "n_live")}
         ${chk("on_complete", "n_complete")}${chk("on_cancelled", "n_cancelled")}${chk("on_error", "n_error")}</div>
@@ -343,7 +430,7 @@ class PrintLogPanel extends HTMLElement {
       for (const k of ["progress", "complete", "cancelled", "error"]) for (const x of ["_title", "_message"]) notifications[k + x] = v(k + x).value;
       try {
         this.settings = await this.api("PUT", "settings", {failed_cost_pct: parseFloat(v("failed_cost_pct").value), energy_price_micro: Math.round(parseFloat(v("energy_price").value || 0) * 1e6),
-          energy_price_entity: v("energy_price_entity").value, notifications});
+          energy_price_entity: v("energy_price_entity").value, low_stock_m: parseFloat(v("low_stock_m").value || 0), notifications});
         alert(t("saved"));
       } catch (err) { alert(err.message); }
     };
