@@ -56,6 +56,7 @@ export const T = {
     settle_btn: "Settle", settle_none: "Nothing open for this selection.", pick_person: "Pick a person to settle.",
     settle_done: "Settlement saved.", history: "History", undo: "Undo", date: "Date", period_all: "all", no_settlements: "No settlements yet.",
     undo_confirm: "Undo this settlement? The prints become unpaid again.",
+    selected: "Selected", sel_all: "Select all", sel_none: "Select none", settle_pick: "Select at least one print.",
   },
   nl: {
     title: "Print log", next_print: "Volgende print", next_hint: "Wordt gebruikt voor de volgende prints die op deze printer eindigen.",
@@ -112,6 +113,7 @@ export const T = {
     settle_btn: "Afrekenen", settle_none: "Niets openstaand voor deze selectie.", pick_person: "Kies een persoon om af te rekenen.",
     settle_done: "Afrekening opgeslagen.", history: "Geschiedenis", undo: "Ongedaan maken", date: "Datum", period_all: "alles", no_settlements: "Nog geen afrekeningen.",
     undo_confirm: "Deze afrekening ongedaan maken? De prints worden weer onbetaald.",
+    selected: "Geselecteerd", sel_all: "Alles selecteren", sel_none: "Niets selecteren", settle_pick: "Selecteer minstens één print.",
   },
 };
 export function makeT(lang) {

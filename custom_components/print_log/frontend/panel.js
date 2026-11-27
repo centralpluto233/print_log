@@ -1,5 +1,6 @@
 /* Print Log panel - vanilla web component, no external dependencies. */
 import {LANGS, makeT} from "./i18n.js";
+import {renderSettlements} from "./settlements.js";
 
 const CSS = `
 :host{display:block;height:100%;min-height:100vh;overflow:auto;background:var(--primary-background-color);color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family,Roboto,sans-serif);color-scheme:light dark}
@@ -51,7 +52,7 @@ class PrintLogPanel extends HTMLElement {
     this.tab = "prints"; this.filters = {}; this.sort = "ended_at"; this.order = "desc"; this.page = 0; this.group = "person";
     this.lists = {people: [], roles: [], filaments: [], printers: []}; this.settings = {};
     this.prefs = {theme: "auto", lang: "auto", size: 25}; this.printerId = null;
-    this.settle = {person: "", period: "", final: null};
+    this.settle = {person: "", period: "", from: "", to: "", filament: "", q: "", sel: null, final: null};
     this.t = makeT("en");
   }
   set hass(h) { const first = !this._hass; this._hass = h; if (first) this.init(); }
@@ -325,54 +326,7 @@ class PrintLogPanel extends HTMLElement {
       });
   }
 
-  async viewSettlements(c) {
-    const t = this.t, S = this.settle, people = this.lists.people.filter((p) => !p.archived || p.id == S.person);
-    let pv = null, open = [];
-    if (S.person) {
-      pv = await this.api("GET", `settlement_preview?person=${S.person}${S.period ? `&period=${S.period}` : ""}`);
-      if (pv.prints) {
-        const q = new URLSearchParams({person: S.person, paid: "no", limit: "1000", sort: "ended_at", order: "asc"});
-        if (S.period) { const [y, m] = S.period.split("-").map(Number); q.set("from", `${S.period}-01`); q.set("to", `${S.period}-${String(new Date(y, m, 0).getDate()).padStart(2, "0")}`); }
-        open = (await this.api("GET", `prints?${q}`)).items;
-      }
-    }
-    const hist = await this.api("GET", `settlements${S.person ? `?person=${S.person}` : ""}`);
-    const sign = (v) => (v > 0 ? "+" : "") + this.moneyP(v);
-    const final0 = pv ? (S.final ?? pv.suggestions.cent) : 0;
-    c.innerHTML = `<div class="card bar"><label>${t("person")}<select id="s_person"><option value="">${t("choose")}</option>${people.map((p) => `<option value="${p.id}" ${p.id == S.person ? "selected" : ""}>${esc(p.name)}</option>`).join("")}</select></label>
-      <label>${t("period")}<input type="month" id="s_period" value="${esc(S.period)}"></label></div>
-      ${!pv ? `<div class="card muted">${t("pick_person")}</div>` : !pv.prints ? `<div class="card muted">${t("settle_none")}</div>` : `<div class="card">
-        <div class="tot"><div><span class="muted">${t("open_prints")}</span><b>${pv.prints}</b></div><div><span class="muted">${t("calculated")}</span><b>${this.moneyP(pv.calculated)}</b></div>
-          <div><span class="muted">${t("profit")}</span><b>${this.moneyP(pv.profit)}</b></div></div>
-        ${this.admin ? `<div class="bar" style="margin-top:10px"><button class="sec" data-r="cent">${t("round_cent")}</button><button class="sec" data-r="50c">${t("round_50")}</button><button class="sec" data-r="euro">${t("round_euro")}</button>
-          <label>${t("final_amount")}<input type="number" step="0.01" min="0" id="s_final" value="${Number(final0).toFixed(2)}"></label>
-          <span>${t("difference")}: <b id="s_diff"></b></span>
-          <label>${t("notes")}<input id="s_note"></label><button id="s_go">${t("settle_btn")}</button></div>` : ""}
-        <table style="margin-top:10px"><thead><tr><th>${t("end")}</th><th>${t("file")}</th><th>${t("filament")}</th><th class="n">${t("price")}</th></tr></thead><tbody>
-        ${open.map((p) => `<tr><td>${this.dt(p.ended_at)}</td><td>${esc(p.filename)}</td><td>${esc(p.filament)}</td><td class="n">${this.moneyP(p.price)}</td></tr>`).join("")}</tbody></table></div>`}
-      <div class="card" style="overflow:auto"><h3>${t("history")}</h3>${hist.length ? `<table><thead><tr><th>${t("date")}</th><th>${t("person")}</th><th>${t("period").split(" (")[0]}</th><th class="n">${t("t_prints")}</th><th class="n">${t("calculated")}</th><th class="n">${t("final_amount")}</th><th class="n">${t("difference")}</th><th>${t("notes")}</th><th></th></tr></thead><tbody>
-        ${hist.map((h) => `<tr><td>${this.dt(h.created_at)}</td><td>${esc(h.person)}</td><td>${esc(h.period || t("period_all"))}</td><td class="n">${h.prints_count}</td><td class="n">${this.moneyP(h.calculated)}</td><td class="n">${this.moneyP(h.final)}</td><td class="n">${sign(h.diff)}</td><td>${esc(h.note)}</td><td>${this.admin ? `<button class="tiny sec" data-undo="${h.id}">${t("undo")}</button>` : ""}</td></tr>`).join("")}</tbody></table>` : `<span class="muted">${t("no_settlements")}</span>`}</div>`;
-    c.querySelector("#s_person").onchange = (e) => { S.person = e.target.value; S.final = null; this.render(); };
-    c.querySelector("#s_period").onchange = (e) => { S.period = e.target.value; S.final = null; this.render(); };
-    const fin = c.querySelector("#s_final"), diff = c.querySelector("#s_diff");
-    const upd = () => { if (fin && diff && pv) diff.textContent = sign((parseFloat(fin.value) || 0) - pv.calculated); };
-    if (fin) {
-      upd(); fin.oninput = () => { S.final = parseFloat(fin.value); upd(); };
-      c.querySelectorAll("[data-r]").forEach((b) => (b.onclick = () => { fin.value = Number(pv.suggestions[b.dataset.r]).toFixed(2); S.final = parseFloat(fin.value); upd(); }));
-      c.querySelector("#s_go").onclick = async () => {
-        const final = parseFloat(fin.value);
-        if (isNaN(final) || final < 0) { alert(t("final_amount")); return; }
-        try {
-          await this.api("POST", "settlements", {person_id: parseInt(S.person), print_ids: pv.print_ids, final, note: c.querySelector("#s_note").value, period: S.period || null});
-          S.final = null; alert(t("settle_done")); this.render();
-        } catch (e) { alert(e.message); }
-      };
-    }
-    c.querySelectorAll("[data-undo]").forEach((b) => (b.onclick = async () => {
-      if (!confirm(t("undo_confirm"))) return;
-      try { await this.api("DELETE", "settlements/" + b.dataset.undo); this.render(); } catch (e) { alert(e.message); }
-    }));
-  }
+  viewSettlements(c) { return renderSettlements(this, c); }
 
   async viewStats(c) {
     const t = this.t, rows = await this.api("GET", `stats?${this.qs({group_by: this.group})}`);
