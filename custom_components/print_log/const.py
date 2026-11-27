@@ -1,6 +1,6 @@
 """Constants for Print Log."""
 DOMAIN = "print_log"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 PANEL_URL = "print-log"
 STATIC_URL = "/print_log_static"
 SIGNAL_UPDATED = "print_log_updated"
