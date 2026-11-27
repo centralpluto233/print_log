@@ -71,7 +71,7 @@ class _Base(HomeAssistantView):
 
 
 def _filters(request: web.Request) -> dict:
-    keys = ("person", "role", "filament", "printer", "status", "from", "to", "min_duration", "max_duration", "q")
+    keys = ("person", "role", "filament", "printer", "status", "paid", "from", "to", "min_duration", "max_duration", "q")
     return {k: request.query[k] for k in keys if k in request.query}
 
 
@@ -108,6 +108,62 @@ class PrintView(_Base):
 
     async def delete(self, request, item_id):
         res = await self._write(request, self.data.store.delete_print, int(item_id))
+        if isinstance(res, web.Response):
+            return res
+        return web.json_response({"deleted": True}) if res else _err(404, "not found")
+
+
+class PaidView(_Base):
+    """Bulk mark prints as paid / unpaid: POST {"ids": [1, 2], "paid": true}."""
+    url, name = "/api/print_log/paid", "api:print_log:paid"
+
+    async def post(self, request):
+        return await self._body_write(request, self._paid)
+
+    def _paid(self, body):
+        ids = body.get("ids")
+        if not isinstance(ids, list):
+            raise ValueError("ids must be a list")
+        return {"updated": self.data.store.mark_paid(ids, bool(body.get("paid", True)))}
+
+
+class SettlementPreviewView(_Base):
+    """Open prints of one person: GET ?person=ID[&period=YYYY-MM]."""
+    url, name = "/api/print_log/settlement_preview", "api:print_log:settlement_preview"
+
+    async def get(self, request):
+        q = request.query
+        try:
+            res = await self._run(self.data.store.settlement_preview, int(q.get("person")), q.get("period") or None)
+        except (TypeError, ValueError) as e:
+            return _err(400, str(e))
+        return web.json_response(res)
+
+
+class SettlementsView(_Base):
+    url, name = "/api/print_log/settlements", "api:print_log:settlements"
+
+    async def get(self, request):
+        person = request.query.get("person")
+        try:
+            res = await self._run(self.data.store.list_settlements, int(person) if person else None)
+        except (TypeError, ValueError) as e:
+            return _err(400, str(e))
+        return web.json_response(res)
+
+    async def post(self, request):
+        return await self._body_write(request, self._settle, status=201)
+
+    def _settle(self, body):
+        return self.data.store.settle(int(body.get("person_id")), body.get("print_ids") or [],
+                                      body.get("final"), body.get("note"), body.get("period"))
+
+
+class SettlementItemView(_Base):
+    url, name = "/api/print_log/settlements/{item_id}", "api:print_log:settlement"
+
+    async def delete(self, request, item_id):
+        res = await self._write(request, self.data.store.unsettle, int(item_id))
         if isinstance(res, web.Response):
             return res
         return web.json_response({"deleted": True}) if res else _err(404, "not found")
@@ -176,7 +232,9 @@ class SettingsView(_Base):
 
 
 def async_register_views(hass: HomeAssistant) -> None:
-    views: list[HomeAssistantView] = [PrintsView(hass), PrintView(hass), StatsView(hass), ExportView(hass), SettingsView(hass)]
+    views: list[HomeAssistantView] = [
+        PrintsView(hass), PaidView(hass), PrintView(hass), StatsView(hass), ExportView(hass), SettingsView(hass),
+        SettlementPreviewView(hass), SettlementsView(hass), SettlementItemView(hass)]
     for t in TABLES:
         views += [CollectionView(hass, t), ItemView(hass, t)]
     for v in views:
