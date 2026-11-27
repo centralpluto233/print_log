@@ -1,7 +1,7 @@
 import json
 import sqlite3
 import pytest
-from pl.store import Store
+from pl.store import Store, SCHEMA_VERSION
 
 
 @pytest.fixture
@@ -76,6 +76,6 @@ def test_migration_from_v1(tmp_path):
     c.commit(); c.close()
     s = Store(path)
     s.init()
-    assert s.get_setting("schema_version") == 2
+    assert s.get_setting("schema_version") == SCHEMA_VERSION
     assert s.list_prints({})["items"][0]["filename"] == "old.gcode"
     s.init()
