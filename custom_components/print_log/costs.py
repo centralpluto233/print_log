@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 MICRO = 1_000_000
+CENT_MICRO = 10_000
 
 
 def euro_to_micro(value: float) -> int:
@@ -10,6 +11,12 @@ def euro_to_micro(value: float) -> int:
 
 def micro_to_euro(value: int | None) -> float:
     return round((value or 0) / MICRO, 6)
+
+
+def round_up_micro(value: int, step_micro: int = CENT_MICRO) -> int:
+    """Round a micro-euro amount up to a multiple of step_micro (default: a whole cent)."""
+    step = max(1, int(step_micro))
+    return -(-int(value) // step) * step
 
 
 def compute_costs(

@@ -12,10 +12,10 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .costs import compute_costs, euro_to_micro, micro_to_euro
+from .costs import CENT_MICRO, compute_costs, euro_to_micro, micro_to_euro, round_up_micro
 from .defaults import DEFAULT_NOTIFICATIONS, DEFAULT_STATE_MAP
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_ROLES = ("familie", "vrienden", "extern")
 
 SCHEMA = """
@@ -63,6 +63,22 @@ MIGRATIONS = {
         "ALTER TABLE prints ADD COLUMN energy_price_micro INTEGER",
         "CREATE INDEX IF NOT EXISTS idx_prints_printer ON prints(printer_id)",
     ],
+    3: [
+        "ALTER TABLE filaments ADD COLUMN brand TEXT",
+        "ALTER TABLE filaments ADD COLUMN color TEXT",
+        "ALTER TABLE filaments ADD COLUMN color_hex TEXT",
+        "ALTER TABLE filaments ADD COLUMN stock_m REAL",
+        "ALTER TABLE filaments ADD COLUMN stock_at TEXT",
+        """CREATE TABLE IF NOT EXISTS settlements (
+          id INTEGER PRIMARY KEY, person_id INTEGER NOT NULL REFERENCES people(id),
+          period TEXT, prints_count INTEGER NOT NULL DEFAULT 0,
+          calculated_micro INTEGER NOT NULL DEFAULT 0, final_micro INTEGER NOT NULL DEFAULT 0,
+          diff_micro INTEGER NOT NULL DEFAULT 0, note TEXT, created_at TEXT NOT NULL)""",
+        "ALTER TABLE prints ADD COLUMN paid_at TEXT",
+        "ALTER TABLE prints ADD COLUMN sale_price_micro INTEGER",
+        "ALTER TABLE prints ADD COLUMN settlement_id INTEGER REFERENCES settlements(id)",
+        "CREATE INDEX IF NOT EXISTS idx_prints_paid ON prints(paid_at)",
+    ],
 }
 
 PRINTER_ENTITY_KEYS = ("state_entity", "filename_entity", "filament_entity", "progress_entity",
@@ -70,7 +86,7 @@ PRINTER_ENTITY_KEYS = ("state_entity", "filename_entity", "filament_entity", "pr
 TABLE_FIELDS = {
     "roles": ("name", "modifier_pct", "archived"),
     "people": ("name", "default_role_id", "modifier_pct", "archived"),
-    "filaments": ("name", "material", "price_per_m_micro", "archived"),
+    "filaments": ("name", "material", "brand", "color", "color_hex", "stock_m", "price_per_m_micro", "archived"),
     "printers": ("name", "state_map", "length_unit", "current_person_id", "current_role_id",
                  "current_filament_id", "archived", *PRINTER_ENTITY_KEYS),
 }
@@ -79,12 +95,16 @@ PRINT_FIELDS = (
     "filename", "person_id", "role_id", "filament_id", "printer_id", "status", "started_at",
     "ended_at", "duration_s", "length_m", "length_auto_m", "energy_kwh", "thumbnail", "source",
     "price_per_m_micro", "modifier_pct", "energy_cost_micro", "energy_price_micro", "notes",
+    "paid_at", "sale_price_micro",
 )
+EFFECTIVE = "COALESCE(p.sale_price_micro, p.total_cost_micro)"
+PROFIT = f"({EFFECTIVE} - p.material_cost_micro - p.energy_cost_micro)"
 SORTS = {
     "ended_at": "p.ended_at", "filename": "p.filename COLLATE NOCASE", "length_m": "p.length_m",
     "total_cost": "p.total_cost_micro", "duration_s": "p.duration_s", "person": "pe.name COLLATE NOCASE",
     "filament": "f.name COLLATE NOCASE", "status": "p.status", "role": "r.name COLLATE NOCASE",
-    "printer": "pr.name COLLATE NOCASE", "energy_kwh": "p.energy_kwh",
+    "printer": "pr.name COLLATE NOCASE", "energy_kwh": "p.energy_kwh", "paid_at": "p.paid_at",
+    "price": EFFECTIVE, "profit": PROFIT,
 }
 GROUPS = {
     "person": "COALESCE(pe.name, '(?)')", "role": "COALESCE(r.name, '(?)')",
@@ -143,7 +163,8 @@ class Store:
                 for stmt in MIGRATIONS.get(target, []):
                     c.execute(stmt)
                 self._set(c, "schema_version", target)
-            for k, v in (("failed_cost_pct", 100), ("energy_price_micro", 0), ("energy_price_entity", None)):
+            for k, v in (("failed_cost_pct", 100), ("energy_price_micro", 0), ("energy_price_entity", None),
+                         ("low_stock_m", 50)):
                 if self._get(c, k, "__none__") == "__none__" and self._get(c, k) is None:
                     self._set(c, k, v)
 
@@ -178,7 +199,7 @@ class Store:
         return out
 
     def update_settings(self, data: dict[str, Any]) -> dict[str, Any]:
-        simple = {"failed_cost_pct": float, "energy_price_micro": int,
+        simple = {"failed_cost_pct": float, "energy_price_micro": int, "low_stock_m": float,
                   "energy_price_entity": lambda v: str(v).strip() or None}
         with self._db() as c:
             for k, v in data.items():
@@ -209,10 +230,23 @@ class Store:
             where = "" if include_archived else "WHERE archived = 0"
             rows = [dict(r) for r in c.execute(f"SELECT * FROM {table} {where} ORDER BY name COLLATE NOCASE")]
             counts = {r["k"]: r["n"] for r in c.execute(f"SELECT {FK[table]} AS k, COUNT(*) AS n FROM prints GROUP BY k")}
+            low = self._get(c, "low_stock_m", 50)
+            used = {}
+            if table == "filaments":
+                for f in rows:
+                    if f["stock_m"] is not None:
+                        used[f["id"]] = c.execute(
+                            "SELECT COALESCE(SUM(length_m), 0) FROM prints WHERE filament_id=? AND ended_at >= ?",
+                            (f["id"], f["stock_at"] or "")).fetchone()[0]
         for r in rows:
             r["print_count"] = counts.get(r["id"], 0)
             if table == "filaments":
                 r["price_per_m"] = micro_to_euro(r["price_per_m_micro"])
+                if r["stock_m"] is None:
+                    r["remaining_m"], r["low_stock"] = None, False
+                else:
+                    r["remaining_m"] = round(r["stock_m"] - used[r["id"]], 3)
+                    r["low_stock"] = low is not None and r["remaining_m"] <= low
             if table == "printers":
                 sm = json.loads(r["state_map"] or "{}")
                 r["state_map"] = {k: sm.get(k) or v for k, v in DEFAULT_STATE_MAP.items()}
@@ -233,6 +267,11 @@ class Store:
         for k in PRINTER_ENTITY_KEYS:
             if k in out:
                 out[k] = str(out[k] or "").strip() or None
+        for k in ("material", "brand", "color", "color_hex"):
+            if k in out:
+                out[k] = str(out[k] or "").strip() or None
+        if "stock_m" in out:
+            out["stock_m"] = _num(out["stock_m"])
         if "state_map" in out:
             sm = out["state_map"] if isinstance(out["state_map"], dict) else {}
             out["state_map"] = json.dumps({k: [str(x).strip() for x in (sm.get(k) or []) if str(x).strip()]
@@ -250,6 +289,8 @@ class Store:
 
     def add_item(self, table: str, data: dict) -> dict:
         d = self._clean(table, data)
+        if table == "filaments" and d.get("stock_m") is not None:
+            d["stock_at"] = utc_now_iso()
         with self._db() as c:
             cur = c.execute(f"INSERT INTO {table}({','.join(d)}) VALUES ({','.join('?' * len(d))})", list(d.values()))
             return dict(c.execute(f"SELECT * FROM {table} WHERE id=?", (cur.lastrowid,)).fetchone())
@@ -257,6 +298,12 @@ class Store:
     def update_item(self, table: str, item_id: int, data: dict) -> dict | None:
         d = self._clean(table, data, partial=True)
         with self._db() as c:
+            if table == "filaments" and "stock_m" in d:
+                old = c.execute("SELECT stock_m FROM filaments WHERE id=?", (item_id,)).fetchone()
+                if old is not None and old["stock_m"] == d["stock_m"]:
+                    d.pop("stock_m")
+                else:
+                    d["stock_at"] = utc_now_iso()
             if d:
                 c.execute(f"UPDATE {table} SET {','.join(k + '=?' for k in d)} WHERE id=?", [*d.values(), item_id])
             row = c.execute(f"SELECT * FROM {table} WHERE id=?", (item_id,)).fetchone()
@@ -268,6 +315,8 @@ class Store:
             n = c.execute(f"SELECT COUNT(*) FROM prints WHERE {FK[table]}=?", (item_id,)).fetchone()[0]
             if table == "roles":
                 n += c.execute("SELECT COUNT(*) FROM people WHERE default_role_id=?", (item_id,)).fetchone()[0]
+            if table == "people":
+                n += c.execute("SELECT COUNT(*) FROM settlements WHERE person_id=?", (item_id,)).fetchone()[0]
             if n:
                 c.execute(f"UPDATE {table} SET archived=1 WHERE id=?", (item_id,))
                 return "archived"
@@ -298,6 +347,13 @@ class Store:
 
     # ---------- prints ----------
     def _prepare(self, c, d: dict, existing: dict | None) -> dict:
+        d = dict(d)
+        if "sale_price" in d:
+            sp = d.pop("sale_price")
+            d["sale_price_micro"] = None if sp in (None, "") else euro_to_micro(sp)
+        if "paid" in d:
+            paid = d.pop("paid")
+            d["paid_at"] = (existing or {}).get("paid_at") or utc_now_iso() if paid else None
         row = dict(existing or {})
         was = lambda k: existing is not None and k in d and d[k] != existing[k]  # noqa: E731
         changed_person, changed_role, changed_fil = was("person_id"), was("role_id"), was("filament_id")
@@ -310,6 +366,8 @@ class Store:
             row[k] = _int(row.get(k))
         row["length_m"] = _num(row.get("length_m"), 0.0)
         row["energy_kwh"] = _num(row.get("energy_kwh"))
+        row["sale_price_micro"] = _int(row.get("sale_price_micro"))
+        row["paid_at"] = row.get("paid_at") or None
         person = c.execute("SELECT * FROM people WHERE id=?", (row["person_id"],)).fetchone() if row["person_id"] else None
         if row["role_id"] is None and person and person["default_role_id"]:
             row["role_id"], changed_role = person["default_role_id"], True
@@ -379,6 +437,11 @@ class Store:
         d = dict(r)
         for k in ("material_cost", "energy_cost", "total_cost", "price_per_m"):
             d[k] = micro_to_euro(d[k + "_micro"])
+        effective = d["total_cost_micro"] if d["sale_price_micro"] is None else d["sale_price_micro"]
+        d["sale_price"] = None if d["sale_price_micro"] is None else micro_to_euro(d["sale_price_micro"])
+        d["price"] = micro_to_euro(effective)
+        d["profit"] = micro_to_euro(effective - d["material_cost_micro"] - d["energy_cost_micro"])
+        d["paid"] = d["paid_at"] is not None
         d["incomplete"] = d["person_id"] is None or d["filament_id"] is None
         return d
 
@@ -400,6 +463,10 @@ class Store:
             else:
                 cl.append(f"{col} = ?")
                 args.append(v)
+        if f.get("paid") in ("yes", "true", "1", True):
+            cl.append("p.paid_at IS NOT NULL")
+        elif f.get("paid") in ("no", "false", "0", False):
+            cl.append("p.paid_at IS NULL")
         if f.get("from"):
             cl.append("p.ended_at >= ?"); args.append(f["from"])
         if f.get("to"):
@@ -417,11 +484,17 @@ class Store:
         order = SORTS.get(sort, SORTS["ended_at"]) + (" DESC" if desc else " ASC")
         with self._db() as c:
             total = c.execute(f"SELECT COUNT(*) {BASE_FROM}{where}", args).fetchone()[0]
-            sums = c.execute(f"SELECT COALESCE(SUM(p.total_cost_micro),0) t, COALESCE(SUM(p.length_m),0) l, "
-                             f"COALESCE(SUM(p.energy_kwh),0) e {BASE_FROM}{where}", args).fetchone()
+            sums = c.execute(
+                f"SELECT COALESCE(SUM(p.total_cost_micro),0) t, COALESCE(SUM(p.length_m),0) l, "
+                f"COALESCE(SUM(p.energy_kwh),0) e, COALESCE(SUM({EFFECTIVE}),0) price, "
+                f"COALESCE(SUM({PROFIT}),0) profit, "
+                f"COALESCE(SUM(CASE WHEN p.paid_at IS NULL THEN {EFFECTIVE} ELSE 0 END),0) unpaid "
+                f"{BASE_FROM}{where}", args).fetchone()
             rows = c.execute(f"{self.SELECT}{where} ORDER BY {order}, p.id DESC LIMIT ? OFFSET ?", [*args, limit, offset]).fetchall()
         return {"total": total, "total_cost": micro_to_euro(sums["t"]), "total_length_m": round(sums["l"], 3),
-                "total_energy_kwh": round(sums["e"], 3), "items": [self._out(r) for r in rows]}
+                "total_energy_kwh": round(sums["e"], 3), "total_price": micro_to_euro(sums["price"]),
+                "total_profit": micro_to_euro(sums["profit"]), "total_unpaid": micro_to_euro(sums["unpaid"]),
+                "items": [self._out(r) for r in rows]}
 
     def stats(self, group_by: str, f: dict) -> list[dict]:
         key = GROUPS.get(group_by)
@@ -433,16 +506,20 @@ class Store:
             rows = c.execute(
                 f"SELECT {key} AS k, COUNT(*) AS prints, SUM(p.length_m) AS length_m, "
                 f"COALESCE(SUM(p.duration_s),0) AS duration_s, SUM(p.total_cost_micro) AS cost, "
+                f"COALESCE(SUM({PROFIT}),0) AS profit, "
+                f"COALESCE(SUM(CASE WHEN p.paid_at IS NULL THEN {EFFECTIVE} ELSE 0 END),0) AS unpaid, "
                 f"COALESCE(SUM(p.energy_kwh),0) AS kwh {BASE_FROM}{where} GROUP BY k ORDER BY {order}", args).fetchall()
         return [{"key": r["k"], "prints": r["prints"], "length_m": round(r["length_m"] or 0, 3),
                  "duration_s": r["duration_s"], "energy_kwh": round(r["kwh"], 3),
-                 "total_cost": micro_to_euro(r["cost"])} for r in rows]
+                 "total_cost": micro_to_euro(r["cost"]), "profit": micro_to_euro(r["profit"]),
+                 "unpaid": micro_to_euro(r["unpaid"])} for r in rows]
 
     def export_csv(self, f: dict) -> str:
         data = self.list_prints(f, limit=1_000_000)["items"]
         buf = io.StringIO()
         cols = ["id", "ended_at", "started_at", "duration_s", "filename", "printer", "person", "role", "filament", "status",
-                "length_m", "price_per_m", "material_cost", "energy_kwh", "energy_cost", "modifier_pct", "total_cost", "notes"]
+                "length_m", "price_per_m", "material_cost", "energy_kwh", "energy_cost", "modifier_pct", "total_cost",
+                "sale_price", "price", "profit", "paid_at", "notes"]
         wr = csv.DictWriter(buf, fieldnames=cols, extrasaction="ignore")
         wr.writeheader()
         wr.writerows(data)
@@ -454,6 +531,90 @@ class Store:
             last = c.execute(self.SELECT + " ORDER BY p.ended_at DESC, p.id DESC LIMIT 1").fetchone()
         return {"prints": r["n"], "total_cost": micro_to_euro(r["t"]), "length_m": round(r["l"], 3),
                 "last": self._out(last) if last else None}
+
+    # ---------- paid / settlements ----------
+    def mark_paid(self, print_ids: list[int], paid: bool = True) -> int:
+        """Bulk mark prints as paid (now) or unpaid. Prints inside a settlement must be un-settled instead."""
+        ids = [int(i) for i in print_ids]
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        with self._db() as c:
+            if not paid:
+                n = c.execute(f"SELECT COUNT(*) FROM prints WHERE id IN ({marks}) AND settlement_id IS NOT NULL", ids).fetchone()[0]
+                if n:
+                    raise ValueError("some prints belong to a settlement; undo that settlement first")
+                return c.execute(f"UPDATE prints SET paid_at=NULL WHERE id IN ({marks})", ids).rowcount
+            return c.execute(f"UPDATE prints SET paid_at=? WHERE id IN ({marks}) AND paid_at IS NULL",
+                             [utc_now_iso(), *ids]).rowcount
+
+    def settlement_preview(self, person_id: int, period: str | None = None) -> dict:
+        """Open (unpaid, not yet settled) prints of one person, optionally limited to a month 'YYYY-MM'."""
+        where, args = "p.person_id=? AND p.paid_at IS NULL AND p.settlement_id IS NULL", [int(person_id)]
+        if period:
+            where += " AND substr(p.ended_at, 1, 7) = ?"
+            args.append(period)
+        with self._db() as c:
+            rows = c.execute(f"SELECT p.id, {EFFECTIVE} AS eff, {PROFIT} AS profit FROM prints p WHERE {where} "
+                             f"ORDER BY p.ended_at, p.id", args).fetchall()
+        calc = sum(r["eff"] for r in rows)
+        return {"person_id": int(person_id), "period": period, "print_ids": [r["id"] for r in rows],
+                "prints": len(rows), "calculated": micro_to_euro(calc),
+                "profit": micro_to_euro(sum(r["profit"] for r in rows)),
+                "suggestions": {"cent": micro_to_euro(round_up_micro(calc, CENT_MICRO)),
+                                "50c": micro_to_euro(round_up_micro(calc, 500_000)),
+                                "euro": micro_to_euro(round_up_micro(calc, 1_000_000))}}
+
+    @staticmethod
+    def _settlement_out(r: sqlite3.Row) -> dict:
+        d = dict(r)
+        for k in ("calculated", "final", "diff"):
+            d[k] = micro_to_euro(d[k + "_micro"])
+        return d
+
+    def settle(self, person_id: int, print_ids: list[int], final: float | None = None,
+               note: str | None = None, period: str | None = None) -> dict:
+        """Pay off prints in one settlement. final=None rounds the calculated amount up to a whole cent;
+        otherwise the given amount (whole cents) is used and the difference is stored."""
+        ids = sorted({int(i) for i in print_ids})
+        if not ids:
+            raise ValueError("no prints selected")
+        marks = ",".join("?" * len(ids))
+        with self._db() as c:
+            rows = c.execute(f"SELECT p.id, {EFFECTIVE} AS eff FROM prints p WHERE p.id IN ({marks}) AND p.person_id=? "
+                             f"AND p.paid_at IS NULL AND p.settlement_id IS NULL", [*ids, int(person_id)]).fetchall()
+            if len(rows) != len(ids):
+                raise ValueError("some prints are not payable (other person, or already paid)")
+            calc = sum(r["eff"] for r in rows)
+            if final in (None, ""):
+                final_micro = round_up_micro(calc, CENT_MICRO)
+            else:
+                final_micro = int(round(float(final) * 100)) * CENT_MICRO
+                if final_micro < 0:
+                    raise ValueError("amount cannot be negative")
+            now = utc_now_iso()
+            sid = c.execute(
+                "INSERT INTO settlements(person_id, period, prints_count, calculated_micro, final_micro, diff_micro, note, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)", (int(person_id), period, len(ids), calc, final_micro, final_micro - calc,
+                                             (note or "").strip() or None, now)).lastrowid
+            c.execute(f"UPDATE prints SET paid_at=?, settlement_id=? WHERE id IN ({marks})", [now, sid, *ids])
+            return self._settlement_out(c.execute(
+                "SELECT s.*, pe.name AS person FROM settlements s JOIN people pe ON pe.id = s.person_id WHERE s.id=?", (sid,)).fetchone())
+
+    def list_settlements(self, person_id: int | None = None) -> list[dict]:
+        where, args = ("WHERE s.person_id=?", [int(person_id)]) if person_id else ("", [])
+        with self._db() as c:
+            rows = c.execute("SELECT s.*, pe.name AS person FROM settlements s JOIN people pe ON pe.id = s.person_id "
+                             f"{where} ORDER BY s.created_at DESC, s.id DESC", args).fetchall()
+        return [self._settlement_out(r) for r in rows]
+
+    def unsettle(self, settlement_id: int) -> bool:
+        with self._db() as c:
+            if not c.execute("SELECT 1 FROM settlements WHERE id=?", (settlement_id,)).fetchone():
+                return False
+            c.execute("UPDATE prints SET paid_at=NULL, settlement_id=NULL WHERE settlement_id=?", (settlement_id,))
+            c.execute("DELETE FROM settlements WHERE id=?", (settlement_id,))
+            return True
 
     # ---------- legacy import ----------
     def import_legacy(self, legacy_path: str | Path) -> int:
