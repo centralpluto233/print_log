@@ -19,11 +19,13 @@ DEFAULT_NOTIFICATIONS = {
     "on_complete": True,
     "on_cancelled": True,
     "on_error": True,
+    "on_low_stock": True,
     "clear_after_min": 0,
     "progress_title": "", "progress_message": "",
     "complete_title": "", "complete_message": "",
     "cancelled_title": "", "cancelled_message": "",
     "error_title": "", "error_message": "",
+    "low_stock_title": "", "low_stock_message": "",
 }
 
 TEXTS = {
@@ -36,6 +38,8 @@ TEXTS = {
         "cancelled_message": "{filename} ({percent}% klaar, {length} m, {cost})",
         "error_title": "{printer}: fout tijdens print",
         "error_message": "{filename} ({percent}% klaar, {length} m, {cost})",
+        "low_stock_title": "Filament bijna op: {filament}",
+        "low_stock_message": "Nog {remaining} m over (grens: {limit} m)",
         "unknown": "onbekend",
     },
     "en": {
@@ -47,6 +51,8 @@ TEXTS = {
         "cancelled_message": "{filename} ({percent}% done, {length} m, {cost})",
         "error_title": "{printer}: print failed",
         "error_message": "{filename} ({percent}% done, {length} m, {cost})",
+        "low_stock_title": "Filament almost empty: {filament}",
+        "low_stock_message": "{remaining} m left (limit: {limit} m)",
         "unknown": "unknown",
     },
 }

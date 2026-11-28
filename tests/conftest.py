@@ -8,7 +8,7 @@ def _load():
     pkg = types.ModuleType("pl")
     pkg.__path__ = [str(PKG)]
     sys.modules["pl"] = pkg
-    for name in ("defaults", "costs", "helpers", "store"):
+    for name in ("defaults", "costs", "helpers", "store", "store_ext", "exports"):
         spec = importlib.util.spec_from_file_location(f"pl.{name}", PKG / f"{name}.py")
         mod = importlib.util.module_from_spec(spec)
         sys.modules[f"pl.{name}"] = mod

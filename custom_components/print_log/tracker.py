@@ -1,6 +1,7 @@
 """Follows the entities of each printer and logs a print when it ends."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -77,6 +78,7 @@ class PrinterTracker:
         }
         self._persist(force=True)
         self.hass.async_create_task(self._notify_progress(force=True))
+        self.hass.async_create_task(self._capture_thumb(5))
 
     async def _notify_progress(self, force: bool = False) -> None:
         if not self.session or not self.data.notifier:
@@ -86,6 +88,45 @@ class PrinterTracker:
             self.session["percent"] = pct
         await self.data.notifier.progress(self.p, pretty_name(self.session["filename"]), self.session["percent"],
                                           self._remaining(), force=force)
+
+    # ---------- thumbnails ----------
+    async def _grab_thumb(self) -> str | None:
+        """Fetch the printer's thumbnail camera image and store it. Returns the file name, or None."""
+        entity, store = self.p.get("thumbnail_entity"), self.data.store
+        if not entity or not hasattr(store, "save_thumbnail"):
+            return None
+        try:
+            from homeassistant.components.camera import async_get_image
+            image = await async_get_image(self.hass, entity, timeout=10)
+        except Exception:  # noqa: BLE001
+            _LOGGER.debug("No thumbnail available from %s", entity, exc_info=True)
+            return None
+        return await self.hass.async_add_executor_job(store.save_thumbnail, image.content, image.content_type)
+
+    def _drop_thumb(self, name: str | None) -> None:
+        path = self.data.store.thumbnail_path(name) if name and hasattr(self.data.store, "thumbnail_path") else None
+        if path:
+            path.unlink(missing_ok=True)
+
+    async def _capture_thumb(self, delay: float = 0) -> None:
+        """Keep the newest thumbnail of the running print (the file name entity can change a moment after the start)."""
+        session = self.session
+        if not session or not self.p.get("thumbnail_entity"):
+            return
+        if delay:
+            await asyncio.sleep(delay)
+        if self.session is not session:
+            return
+        name = await self._grab_thumb()
+        if not name:
+            return
+        if self.session is not session:
+            await self.hass.async_add_executor_job(self._drop_thumb, name)
+            return
+        old, session["thumb"] = session.get("thumb"), name
+        self._persist(force=True)
+        if old:
+            await self.hass.async_add_executor_job(self._drop_thumb, old)
 
     @callback
     def _handle(self, event: Event) -> None:
@@ -110,6 +151,7 @@ class PrinterTracker:
         elif entity == self.p.get("filename_entity") and new.state not in ("unknown", "unavailable", ""):
             self.session["filename"] = new.state
             self._persist(force=True)
+            self.hass.async_create_task(self._capture_thumb(3))
         elif entity in (self.p.get("progress_entity"), self.p.get("remaining_entity")):
             self.hass.async_create_task(self._notify_progress())
 
@@ -124,6 +166,8 @@ class PrinterTracker:
         if session.get("energy_start") is not None and end_energy is not None and end_energy >= session["energy_start"]:
             kwh = round(end_energy - session["energy_start"], 4)
         percent = 100.0 if status == "complete" else session.get("percent", 0.0)
+        if not session.get("thumb"):
+            session["thumb"] = await self._grab_thumb()
 
         def _create():
             settings = store.get_settings()
@@ -132,7 +176,8 @@ class PrinterTracker:
                    "started_at": session["started_at"], "ended_at": _iso(ended),
                    "length_m": round(session["length_m"], 3), "length_auto_m": round(session["length_m"], 3),
                    "person_id": printer.get("current_person_id"), "role_id": printer.get("current_role_id"),
-                   "filament_id": printer.get("current_filament_id"), "energy_kwh": kwh}
+                   "filament_id": printer.get("current_filament_id"), "energy_kwh": kwh,
+                   "thumbnail": session.get("thumb")}
             price = None
             if kwh is not None:
                 ent = settings.get("energy_price_entity")
@@ -146,6 +191,7 @@ class PrinterTracker:
             row = await self.hass.async_add_executor_job(_create)
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Could not log print")
+            await self.hass.async_add_executor_job(self._drop_thumb, session.get("thumb"))
             return
         self.hass.bus.async_fire(EVENT_PRINT_FINISHED, {"id": row["id"], "filename": row["filename"], "status": status,
                                                          "printer": self.p["name"], "incomplete": row["incomplete"]})
@@ -154,6 +200,18 @@ class PrinterTracker:
             await self.data.notifier.finished(self.p, status, {
                 "filename": pretty_name(row["filename"]), "percent": int(percent), "length": round(row["length_m"], 1),
                 "cost": f"EUR {row['total_cost']:.2f}", "person": row["person"], "filament": row["filament"]})
+        await self._check_low_stock()
+
+    async def _check_low_stock(self) -> None:
+        store = self.data.store
+        if not hasattr(store, "low_stock_check"):
+            return
+        try:
+            rolls = await self.hass.async_add_executor_job(store.low_stock_check)
+            if rolls and self.data.notifier:
+                await self.data.notifier.low_stock(rolls)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Low stock check failed")
 
 
 class PrinterManager:

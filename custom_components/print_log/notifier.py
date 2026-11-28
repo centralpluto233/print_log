@@ -98,6 +98,18 @@ class Notifier:
             async_call_later(self.hass, c["clear_after_min"] * 60,
                              lambda _now: self.hass.async_create_task(self.clear(printer)))
 
+    async def low_stock(self, rolls: list[dict]) -> None:
+        """One notification per roll that just dropped below the limit. Can be switched off in the settings."""
+        c = self.cfg
+        if not (c["enabled"] and c.get("on_low_stock", True) and self._targets()):
+            return
+        limit = self.data.settings.get("low_stock_m")
+        for roll in rolls:
+            ctx = {"filament": roll.get("name") or "", "remaining": round(roll.get("remaining_m") or 0, 1),
+                   "limit": limit if limit is not None else ""}
+            await self._send(render(self.text("low_stock_message"), ctx), render(self.text("low_stock_title"), ctx),
+                             {"tag": f"print_log_low_{roll['id']}", "channel": "Filament stock", "notification_icon": ICON})
+
     async def clear(self, printer: dict) -> None:
         await self._send("clear_notification", None, {"tag": self.tag(printer)})
 

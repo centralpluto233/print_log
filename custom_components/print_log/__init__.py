@@ -15,7 +15,7 @@ from .api import async_register_views
 from .const import DOMAIN, PANEL_URL, STATIC_URL, VERSION
 from .data import PrintLogData
 from .notifier import Notifier
-from .store import Store
+from .store_ext import ExtStore
 from .tracker import PrinterManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ SET_CURRENT_SCHEMA = vol.Schema({
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    store = Store(hass.config.path("print_log", "prints.db"), hass.config.time_zone)
+    store = ExtStore(hass.config.path("print_log", "prints.db"), hass.config.time_zone)
     await hass.async_add_executor_job(store.init)
     legacy = Path(hass.config.path("prints.db"))
     if legacy.exists():

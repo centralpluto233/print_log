@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN
 from .data import PrintLogData
+from .exports import settlement_csv, settlement_html
 
 TABLES = ("people", "roles", "filaments", "printers")
 
@@ -169,6 +170,37 @@ class SettlementItemView(_Base):
         return web.json_response({"deleted": True}) if res else _err(404, "not found")
 
 
+class SettlementExportView(_Base):
+    """GET ?format=csv|html&lang=nl|en. The html page is meant to be printed or saved as PDF from the browser."""
+    url, name = "/api/print_log/settlements/{item_id}/export", "api:print_log:settlement_export"
+
+    async def get(self, request, item_id):
+        try:
+            detail = await self._run(self.data.store.settlement_detail, int(item_id))
+        except ValueError:
+            return _err(400, "invalid id")
+        if not detail:
+            return _err(404, "not found")
+        lang = request.query.get("lang", "en")
+        if request.query.get("format") == "csv":
+            return web.Response(text=settlement_csv(detail, lang), content_type="text/csv",
+                                headers={"Content-Disposition": f"attachment; filename=settlement_{detail['id']}.csv"})
+        return web.Response(text=settlement_html(detail, lang), content_type="text/html")
+
+
+class ThumbView(_Base):
+    """A stored print thumbnail. Needs a login, so the panel loads it with the user's token."""
+    url, name = "/api/print_log/thumbs/{filename}", "api:print_log:thumb"
+
+    async def get(self, request, filename):
+        path = self.data.store.thumbnail_path(filename)
+        if not path:
+            return _err(404, "not found")
+        body = await self.hass.async_add_executor_job(path.read_bytes)
+        ctype = "image/png" if filename.endswith(".png") else "image/jpeg"
+        return web.Response(body=body, content_type=ctype, headers={"Cache-Control": "private, max-age=86400"})
+
+
 class CollectionView(_Base):
     def __init__(self, hass, table: str) -> None:
         super().__init__(hass)
@@ -234,7 +266,8 @@ class SettingsView(_Base):
 def async_register_views(hass: HomeAssistant) -> None:
     views: list[HomeAssistantView] = [
         PrintsView(hass), PaidView(hass), PrintView(hass), StatsView(hass), ExportView(hass), SettingsView(hass),
-        SettlementPreviewView(hass), SettlementsView(hass), SettlementItemView(hass)]
+        SettlementPreviewView(hass), SettlementsView(hass), SettlementItemView(hass), SettlementExportView(hass),
+        ThumbView(hass)]
     for t in TABLES:
         views += [CollectionView(hass, t), ItemView(hass, t)]
     for v in views:
