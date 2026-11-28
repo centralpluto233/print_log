@@ -1,6 +1,8 @@
 /* Print Log panel - vanilla web component, no external dependencies. */
 import {LANGS, makeT} from "./i18n.js";
 import {renderSettlements} from "./settlements.js";
+import {columnChart, donutChart} from "./charts.js";
+import {loadThumbs} from "./thumbs.js";
 
 const CSS = `
 :host{display:block;height:100%;min-height:100vh;overflow:auto;background:var(--primary-background-color);color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family,Roboto,sans-serif);color-scheme:light dark}
@@ -27,6 +29,10 @@ th{font-weight:500;color:var(--secondary-text-color);white-space:nowrap}th[data-
 td.n,th.n{text-align:right}.tot{display:flex;gap:24px;flex-wrap:wrap}.tot b{font-size:20px;display:block}
 .badge{font-size:11px;padding:1px 6px;border-radius:8px;background:var(--warning-color,#fa0);color:#000}
 .swatch{display:inline-block;width:12px;height:12px;border-radius:50%;border:1px solid var(--divider-color);vertical-align:middle;margin-right:6px}
+.thumb{width:44px;height:44px;object-fit:cover;border-radius:6px;background:var(--divider-color);display:block}
+.legend{display:flex;gap:14px;flex-wrap:wrap;margin:6px 0;font-size:13px}.lg{display:flex;align-items:center;gap:6px;font-size:13px}
+.lg i{display:inline-block;width:12px;height:12px;border-radius:3px}
+.donut{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:8px}
 .ok{color:var(--success-color,#2e7d32)}
 .st-cancelled,.st-error{color:var(--error-color,#c00)}.muted{color:var(--secondary-text-color)}.err{color:var(--error-color,#c00);font-size:13px}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:10;overflow:auto}
@@ -36,7 +42,7 @@ td.n,th.n{text-align:right}.tot{display:flex;gap:24px;flex-wrap:wrap}.tot b{font
 svg text{fill:var(--primary-text-color);font-size:11px}.pager{display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:8px}
 h3{margin:0 0 8px;font-weight:500}
 `;
-const ENTITY_KEYS = ["state_entity", "filename_entity", "filament_entity", "progress_entity", "remaining_entity", "energy_entity"];
+const ENTITY_KEYS = ["state_entity", "filename_entity", "filament_entity", "progress_entity", "remaining_entity", "energy_entity", "thumbnail_entity"];
 const SM_KEYS = ["printing", "paused", "complete", "cancelled", "error", "idle"];
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const dur = (s) => (s == null ? "" : `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`);
@@ -98,6 +104,7 @@ class PrintLogPanel extends HTMLElement {
   get loc() { return this._hass?.locale?.language || this.lang; }
   money(v) { return new Intl.NumberFormat(this.loc, {style: "currency", currency: "EUR", minimumFractionDigits: 2, maximumFractionDigits: 3}).format(v || 0); }
   moneyP(v) { return new Intl.NumberFormat(this.loc, {style: "currency", currency: "EUR", minimumFractionDigits: 2, maximumFractionDigits: 4}).format(v || 0); }
+  axis(v) { return new Intl.NumberFormat(this.loc, {maximumFractionDigits: 2}).format(v); }
   dt(iso) { return iso ? new Date(iso).toLocaleString(this.loc, {dateStyle: "short", timeStyle: "short"}) : ""; }
   dday(iso) { return iso ? new Date(iso).toLocaleDateString(this.loc, {dateStyle: "short"}) : ""; }
 
@@ -170,10 +177,10 @@ class PrintLogPanel extends HTMLElement {
         <div><span class="muted">${t("total_energy")}</span><b>${res.total_energy_kwh.toFixed(2)} kWh</b></div>
         <div style="margin-left:auto;display:flex;gap:8px;align-items:center;flex-wrap:wrap"><button class="sec" id="csv">${t("csv")}</button>
           ${this.admin ? `<button class="sec" id="bpaid">${t("mark_paid")}</button><button class="sec" id="bunpaid">${t("mark_unpaid")}</button><button id="add">${t("add_print")}</button>` : ""}</div></div>
-      <div class="card" style="overflow:auto"><table><thead><tr>${this.admin ? '<th><input type="checkbox" id="selall"></th>' : ""}${th("ended_at", t("end"))}${th("filename", t("file"))}${th("person", t("person"))}${th("role", t("role"))}
+      <div class="card" style="overflow:auto"><table><thead><tr>${this.admin ? '<th><input type="checkbox" id="selall"></th>' : ""}<th></th>${th("ended_at", t("end"))}${th("filename", t("file"))}${th("person", t("person"))}${th("role", t("role"))}
         ${th("filament", t("filament"))}${multi ? th("printer", t("printer")) : ""}${th("duration_s", t("duration"), 1)}${th("length_m", t("meters"), 1)}${th("energy_kwh", t("energy"), 1)}
         ${th("total_cost", t("cost"), 1)}${th("price", t("price"), 1)}${th("profit", t("profit"), 1)}${th("paid_at", t("paid"))}${th("status", t("status"))}<th></th></tr></thead><tbody>
-        ${res.items.map((p) => `<tr>${this.admin ? `<td><input type="checkbox" data-sel="${p.id}"></td>` : ""}<td>${this.dt(p.ended_at)}</td><td>${esc(p.filename) || '<span class="muted">-</span>'}</td>
+        ${res.items.map((p) => `<tr>${this.admin ? `<td><input type="checkbox" data-sel="${p.id}"></td>` : ""}<td>${p.thumbnail ? `<img class="thumb" data-thumb="${esc(p.thumbnail)}" alt="">` : ""}</td><td>${this.dt(p.ended_at)}</td><td>${esc(p.filename) || '<span class="muted">-</span>'}</td>
           <td>${esc(p.person) || `<span class="badge">${t("pick")}</span>`}</td><td>${esc(p.role)}</td><td>${esc(p.filament) || `<span class="badge">${t("pick")}</span>`}</td>
           ${multi ? `<td>${esc(p.printer)}</td>` : ""}<td class="n">${dur(p.duration_s)}</td><td class="n">${p.length_m.toFixed(2)}</td>
           <td class="n">${p.energy_kwh == null ? "" : p.energy_kwh.toFixed(2) + " kWh"}</td><td class="n">${this.money(p.total_cost)}</td>
@@ -181,7 +188,7 @@ class PrintLogPanel extends HTMLElement {
           <td>${p.paid ? `<span class="ok">✓ ${this.dday(p.paid_at)}</span>` : ""}</td>
           <td class="st-${p.status}">${this.stLabel(p.status)}</td>
           <td>${this.admin ? `<button class="tiny sec" data-edit="${p.id}">✎</button> <button class="tiny danger" data-del="${p.id}">✕</button>` : ""}</td></tr>`).join("") ||
-          `<tr><td colspan="16" class="muted">${t("no_prints")}</td></tr>`}</tbody></table>
+          `<tr><td colspan="17" class="muted">${t("no_prints")}</td></tr>`}</tbody></table>
         <div class="pager"><button class="sec tiny" id="prev" ${this.page <= 0 ? "disabled" : ""}>←</button><span>${this.page + 1} / ${pages}</span>
         <button class="sec tiny" id="next" ${this.page + 1 >= pages ? "disabled" : ""}>→</button></div></div>`;
     c.querySelectorAll("#filters select,#filters input").forEach((el) => (el.onchange = () => { this.filters[el.name] = el.value; this.page = 0; this.render(); }));
@@ -204,6 +211,7 @@ class PrintLogPanel extends HTMLElement {
       if (!confirm(t("del_print"))) return;
       try { await this.api("DELETE", "prints/" + b.dataset.del); this.render(); } catch (e) { alert(e.message); }
     }));
+    loadThumbs(this, c).catch(() => {});
   }
   async exportCsv() {
     const r = await this._hass.fetchWithAuth(`/api/print_log/export.csv?${this.qs()}`);
@@ -332,9 +340,9 @@ class PrintLogPanel extends HTMLElement {
     const t = this.t, rows = await this.api("GET", `stats?${this.qs({group_by: this.group})}`);
     const groups = ["person", "role", "filament", "printer", "month", "status"];
     c.innerHTML = `<div class="card bar">${groups.map((k) => `<button class="${k === this.group ? "" : "sec"}" data-g="${k}">${t("g_" + k)}</button>`).join("")}<span class="muted">${t("filters_apply")}</span></div>
-      <div class="card"><b>${t("chart_cost")}</b>${this.bars(rows, "total_cost", (v) => this.money(v))}</div>
-      <div class="card"><b>${t("chart_profit")}</b>${this.bars(rows, "profit", (v) => this.money(v))}</div>
-      <div class="card"><b>${t("chart_len")}</b>${this.bars(rows, "length_m", (v) => v.toFixed(1) + " m")}</div>
+      <div class="card"><b>${t("chart_money")}</b>${columnChart(this, rows)}</div>
+      <div class="grid"><div class="card"><b>${t("chart_share")}</b>${donutChart(this, rows, "total_cost")}</div>
+      <div class="card"><b>${t("chart_len")}</b>${this.bars(rows, "length_m", (v) => v.toFixed(1) + " m")}</div></div>
       <div class="card" style="overflow:auto"><table><thead><tr><th>${t("g_" + this.group)}</th><th class="n">${t("t_prints")}</th><th class="n">${t("meters")}</th><th class="n">${t("duration")}</th><th class="n">${t("energy")}</th><th class="n">${t("cost")}</th><th class="n">${t("profit")}</th><th class="n">${t("unpaid")}</th></tr></thead><tbody>
       ${rows.map((r) => `<tr><td>${esc(r.key)}</td><td class="n">${r.prints}</td><td class="n">${r.length_m.toFixed(1)}</td><td class="n">${dur(r.duration_s)}</td><td class="n">${r.energy_kwh.toFixed(2)} kWh</td><td class="n">${this.money(r.total_cost)}</td><td class="n">${this.money(r.profit)}</td><td class="n">${this.money(r.unpaid)}</td></tr>`).join("")}</tbody></table></div>`;
     c.querySelectorAll("[data-g]").forEach((b) => (b.onclick = () => { this.group = b.dataset.g; this.render(); }));
@@ -366,10 +374,10 @@ class PrintLogPanel extends HTMLElement {
         <label>${t("low_stock_m")}<input name="low_stock_m" type="number" min="0" value="${s.low_stock_m ?? 50}" ${dis}></label></div>
         <p class="muted">${t("energy_hint")}</p></div>
       <div class="card"><h3>${t("notif")}</h3><div class="grid">${chk("enabled", "n_enabled")}${chk("progress", "n_progress")}${chk("live_update", "n_live")}
-        ${chk("on_complete", "n_complete")}${chk("on_cancelled", "n_cancelled")}${chk("on_error", "n_error")}</div>
+        ${chk("on_complete", "n_complete")}${chk("on_cancelled", "n_cancelled")}${chk("on_error", "n_error")}${chk("on_low_stock", "n_low_stock")}</div>
         <div class="grid" style="margin-top:8px">${num("min_step_pct", "n_step")}${num("min_interval_s", "n_interval")}${num("clear_after_min", "n_clear")}</div>
         <h4>${t("n_targets")}</h4>${svcs.length ? svcs.map((x) => `<label class="chk"><input type="checkbox" name="target:${x}" ${targets.includes(x) ? "checked" : ""} ${dis}> notify.${x}</label>`).join("") : `<div class="muted">${t("n_no_targets")}</div>`}
-        <h4>${t("n_templates")}</h4><div class="grid">${["progress", "complete", "cancelled", "error"].map((k) => tpl(k + "_title", `n_${k}_title`) + tpl(k + "_message", `n_${k}_message`)).join("")}</div>
+        <h4>${t("n_templates")}</h4><div class="grid">${["progress", "complete", "cancelled", "error", "low_stock"].map((k) => tpl(k + "_title", `n_${k}_title`) + tpl(k + "_message", `n_${k}_message`)).join("")}</div>
         <div class="row" style="margin-top:10px"><button type="button" class="sec" id="test">${t("n_test")}</button>${this.admin ? `<button type="submit">${t("save")}</button>` : ""}</div></div></form>`;
     c.querySelector("#p_theme").onchange = (e) => this.savePrefs({theme: e.target.value});
     c.querySelector("#p_lang").onchange = (e) => this.savePrefs({lang: e.target.value});
@@ -379,9 +387,9 @@ class PrintLogPanel extends HTMLElement {
       e.preventDefault();
       const f = e.target, v = (k) => f.elements[k];
       const notifications = {targets: svcs.filter((x) => v("target:" + x)?.checked).map((x) => "notify." + x)};
-      for (const k of ["enabled", "progress", "live_update", "on_complete", "on_cancelled", "on_error"]) notifications[k] = v(k).checked;
+      for (const k of ["enabled", "progress", "live_update", "on_complete", "on_cancelled", "on_error", "on_low_stock"]) notifications[k] = v(k).checked;
       for (const k of ["min_step_pct", "min_interval_s", "clear_after_min"]) notifications[k] = parseInt(v(k).value || 0);
-      for (const k of ["progress", "complete", "cancelled", "error"]) for (const x of ["_title", "_message"]) notifications[k + x] = v(k + x).value;
+      for (const k of ["progress", "complete", "cancelled", "error", "low_stock"]) for (const x of ["_title", "_message"]) notifications[k + x] = v(k + x).value;
       try {
         this.settings = await this.api("PUT", "settings", {failed_cost_pct: parseFloat(v("failed_cost_pct").value), energy_price_micro: Math.round(parseFloat(v("energy_price").value || 0) * 1e6),
           energy_price_entity: v("energy_price_entity").value, low_stock_m: parseFloat(v("low_stock_m").value || 0), notifications});

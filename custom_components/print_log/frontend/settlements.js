@@ -1,4 +1,6 @@
 /* Settlements tab: pick a person, filter their open prints, tick the prints to settle now. */
+import {exportSettlement} from "./thumbs.js";
+
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 
 export async function renderSettlements(p, c) {
@@ -35,7 +37,7 @@ export async function renderSettlements(p, c) {
       <table style="margin-top:6px"><thead><tr><th><input type="checkbox" id="s_head" ${T0.n === open.length ? "checked" : ""}></th><th>${t("end")}</th><th>${t("file")}</th><th>${t("filament")}</th><th class="n">${t("meters")}</th><th class="n">${t("price")}</th></tr></thead><tbody>
       ${open.map((x) => `<tr><td><input type="checkbox" data-s="${x.id}" ${S.sel.has(x.id) ? "checked" : ""}></td><td>${p.dt(x.ended_at)}</td><td>${esc(x.filename)}</td><td>${esc(x.filament)}</td><td class="n">${x.length_m.toFixed(2)}</td><td class="n">${p.moneyP(x.price)}</td></tr>`).join("")}</tbody></table></div>`}
     <div class="card" style="overflow:auto"><h3>${t("history")}</h3>${hist.length ? `<table><thead><tr><th>${t("date")}</th><th>${t("person")}</th><th>${t("period").split(" (")[0]}</th><th class="n">${t("t_prints")}</th><th class="n">${t("calculated")}</th><th class="n">${t("final_amount")}</th><th class="n">${t("difference")}</th><th>${t("notes")}</th><th></th></tr></thead><tbody>
-      ${hist.map((h) => `<tr><td>${p.dt(h.created_at)}</td><td>${esc(h.person)}</td><td>${esc(h.period || t("period_all"))}</td><td class="n">${h.prints_count}</td><td class="n">${p.moneyP(h.calculated)}</td><td class="n">${p.moneyP(h.final)}</td><td class="n">${sign(h.diff)}</td><td>${esc(h.note)}</td><td>${p.admin ? `<button class="tiny sec" data-undo="${h.id}">${t("undo")}</button>` : ""}</td></tr>`).join("")}</tbody></table>` : `<span class="muted">${t("no_settlements")}</span>`}</div>`;
+      ${hist.map((h) => `<tr><td>${p.dt(h.created_at)}</td><td>${esc(h.person)}</td><td>${esc(h.period || t("period_all"))}</td><td class="n">${h.prints_count}</td><td class="n">${p.moneyP(h.calculated)}</td><td class="n">${p.moneyP(h.final)}</td><td class="n">${sign(h.diff)}</td><td>${esc(h.note)}</td><td style="white-space:nowrap"><button class="tiny sec" data-exp="${h.id}" data-fmt="html">${t("export_pdf")}</button> <button class="tiny sec" data-exp="${h.id}" data-fmt="csv">${t("export_csv")}</button> ${p.admin ? `<button class="tiny sec" data-undo="${h.id}">${t("undo")}</button>` : ""}</td></tr>`).join("")}</tbody></table>` : `<span class="muted">${t("no_settlements")}</span>`}</div>`;
 
   const reset = () => { S.sel = null; S.final = null; p.render(); };
   c.querySelector("#s_person").onchange = (e) => { S.person = e.target.value; reset(); };
@@ -76,6 +78,7 @@ export async function renderSettlements(p, c) {
       } catch (e) { alert(e.message); }
     };
   }
+  c.querySelectorAll("[data-exp]").forEach((b) => (b.onclick = () => exportSettlement(p, b.dataset.exp, b.dataset.fmt)));
   c.querySelectorAll("[data-undo]").forEach((b) => (b.onclick = async () => {
     if (!confirm(t("undo_confirm"))) return;
     try { await p.api("DELETE", "settlements/" + b.dataset.undo); p.render(); } catch (e) { alert(e.message); }
