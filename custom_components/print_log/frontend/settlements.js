@@ -1,6 +1,4 @@
 /* Settlements tab: pick a person, filter their open prints, tick the prints to settle now. */
-import {exportSettlement} from "./thumbs.js";
-
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 
 export async function renderSettlements(p, c) {
@@ -78,7 +76,7 @@ export async function renderSettlements(p, c) {
       } catch (e) { alert(e.message); }
     };
   }
-  c.querySelectorAll("[data-exp]").forEach((b) => (b.onclick = () => exportSettlement(p, b.dataset.exp, b.dataset.fmt)));
+  c.querySelectorAll("[data-exp]").forEach((b) => (b.onclick = () => p.exportSettlement(p, b.dataset.exp, b.dataset.fmt)));
   c.querySelectorAll("[data-undo]").forEach((b) => (b.onclick = async () => {
     if (!confirm(t("undo_confirm"))) return;
     try { await p.api("DELETE", "settlements/" + b.dataset.undo); p.render(); } catch (e) { alert(e.message); }

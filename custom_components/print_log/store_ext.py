@@ -1,6 +1,7 @@
-"""Store extensions for v0.4.0 (pure Python): thumbnails, low-stock tracking and settlement details."""
+"""Store extensions for v0.4.0 (pure Python): thumbnails, low-stock tracking, settlement details and allocation."""
 from __future__ import annotations
 
+import json
 import re
 import secrets
 
@@ -14,8 +15,26 @@ THUMB_TYPES = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg"}
 THUMB_MAX_BYTES = 2_000_000
 
 
+def split_final(final: int, prices: list[int]) -> list[int] | None:
+    """Spread a final settlement amount (micro-euro) over prints, in proportion to their price.
+
+    The shares add up to exactly `final`. Returns None when the prices already add up to it (nothing to change)."""
+    n = len(prices)
+    total = sum(prices)
+    if not n or total == final:
+        return None
+    if total <= 0:
+        base, extra = divmod(final, n)
+        return [base + (1 if i < extra else 0) for i in range(n)]
+    shares = [final * p // total for p in prices]
+    order = sorted(range(n), key=lambda i: (-prices[i], i))
+    for k in range(final - sum(shares)):
+        shares[order[k % n]] += 1
+    return shares
+
+
 class ExtStore(Store):
-    """Store with the v0.4.0 additions. Its own migration counter (ext_version) keeps the base schema untouched."""
+    """Store with the v0.4.0 additions. Its own migration markers keep the base schema untouched."""
 
     def init(self) -> None:
         super().init()
@@ -25,6 +44,13 @@ class ExtStore(Store):
                 if "thumbnail_entity" not in cols:
                     c.execute("ALTER TABLE printers ADD COLUMN thumbnail_entity TEXT")
                 self._set(c, "ext_version", 1)
+            if not self._get(c, "ext_alloc_done", False):
+                cols = {r["name"] for r in c.execute("PRAGMA table_info(settlements)")}
+                if "allocation" not in cols:
+                    c.execute("ALTER TABLE settlements ADD COLUMN allocation TEXT")
+                for r in c.execute("SELECT id FROM settlements WHERE allocation IS NULL").fetchall():
+                    self._allocate(c, r["id"])
+                self._set(c, "ext_alloc_done", True)
 
     def _clean(self, table, data, partial=False):
         out = super()._clean(table, data, partial)
@@ -84,4 +110,36 @@ class ExtStore(Store):
             if not s:
                 return None
             rows = c.execute(self.SELECT + " WHERE p.settlement_id=? ORDER BY p.ended_at, p.id", (int(settlement_id),)).fetchall()
-        return {**self._settlement_out(s), "prints": [self._out(r) for r in rows]}
+        out = {k: v for k, v in self._settlement_out(s).items() if k != "allocation"}
+        return {**out, "prints": [self._out(r) for r in rows]}
+
+    def _allocate(self, c, settlement_id: int) -> None:
+        """Spread the final amount of a settlement over its prints as sale prices (so statistics show what was received).
+
+        The sale prices the prints had before are saved in the settlement, so undoing it restores them."""
+        s = c.execute("SELECT final_micro FROM settlements WHERE id=?", (settlement_id,)).fetchone()
+        rows = c.execute("SELECT id, sale_price_micro, total_cost_micro FROM prints WHERE settlement_id=? ORDER BY id",
+                         (settlement_id,)).fetchall()
+        original = {str(r["id"]): r["sale_price_micro"] for r in rows}
+        prices = [r["total_cost_micro"] if r["sale_price_micro"] is None else r["sale_price_micro"] for r in rows]
+        shares = split_final(int(s["final_micro"]), prices) if s else None
+        if shares is not None:
+            for r, share in zip(rows, shares):
+                c.execute("UPDATE prints SET sale_price_micro=? WHERE id=?", (share, r["id"]))
+        c.execute("UPDATE settlements SET allocation=? WHERE id=?", (json.dumps(original), settlement_id))
+
+    def settle(self, *args, **kwargs):
+        result = super().settle(*args, **kwargs)
+        if isinstance(result, dict) and result.get("id") is not None:
+            with self._db() as c:
+                self._allocate(c, int(result["id"]))
+        return result
+
+    def unsettle(self, settlement_id: int) -> bool:
+        with self._db() as c:
+            row = c.execute("SELECT allocation FROM settlements WHERE id=?", (int(settlement_id),)).fetchone()
+            if row and row["allocation"]:
+                for pid, sale in json.loads(row["allocation"]).items():
+                    c.execute("UPDATE prints SET sale_price_micro=? WHERE id=? AND settlement_id=?",
+                              (sale, int(pid), int(settlement_id)))
+        return super().unsettle(settlement_id)

@@ -1,8 +1,8 @@
 /* Print Log panel - vanilla web component, no external dependencies. */
-import {LANGS, makeT} from "./i18n.js";
-import {renderSettlements} from "./settlements.js";
-import {columnChart, donutChart} from "./charts.js";
-import {loadThumbs} from "./thumbs.js";
+// The other modules are loaded with the same ?v=<version> as this file, so a new version never mixes with cached old files.
+const V = new URL(import.meta.url).search;
+const [{LANGS, makeT}, {renderSettlements}, {columnChart, donutChart}, {loadThumbs, exportSettlement}] = await Promise.all([
+  import("./i18n.js" + V), import("./settlements.js" + V), import("./charts.js" + V), import("./thumbs.js" + V)]);
 
 const CSS = `
 :host{display:block;height:100%;min-height:100vh;overflow:auto;background:var(--primary-background-color);color:var(--primary-text-color);font-family:var(--paper-font-body1_-_font-family,Roboto,sans-serif);color-scheme:light dark}
@@ -59,6 +59,7 @@ class PrintLogPanel extends HTMLElement {
     this.lists = {people: [], roles: [], filaments: [], printers: []}; this.settings = {};
     this.prefs = {theme: "auto", lang: "auto", size: 25}; this.printerId = null;
     this.settle = {person: "", period: "", from: "", to: "", filament: "", q: "", sel: null, final: null};
+    this.exportSettlement = exportSettlement;
     this.t = makeT("en");
   }
   set hass(h) { const first = !this._hass; this._hass = h; if (first) this.init(); }
@@ -112,7 +113,7 @@ class PrintLogPanel extends HTMLElement {
     const t = this.t, root = this.shadowRoot.getElementById("root");
     const tabs = ["prints", "settlements", "stats", "people", "filaments", "roles", "printers", "settings"];
     root.innerHTML = `<div class="head"><h1>${t("title")}</h1>
-      <button class="sec tiny" id="theme" title="${t("theme")}">${{auto: "◐", light: "☀", dark: "☾"}[this.prefs.theme] || "◐"}</button></div>${this.currentBar()}
+      <button class="sec tiny" id="theme" title="${t("theme")}">${{auto: "\u25d0", light: "\u2600", dark: "\u263e"}[this.prefs.theme] || "\u25d0"}</button></div>${this.currentBar()}
       <div class="tabs">${tabs.map((k) => `<div class="tab ${k === this.tab ? "on" : ""}" data-tab="${k}">${t("t_" + k)}</div>`).join("")}</div><div id="content"></div>
       <datalist id="ents">${Object.keys(this._hass.states).sort().map((e) => `<option value="${e}">`).join("")}</datalist>`;
     root.querySelector("#theme").onclick = () => this.savePrefs({theme: {auto: "light", light: "dark", dark: "auto"}[this.prefs.theme || "auto"]});
@@ -155,7 +156,7 @@ class PrintLogPanel extends HTMLElement {
     const t = this.t, f = this.filters, size = this.prefs.size || 25, multi = this.printers.length > 1;
     const res = await this.api("GET", `prints?${this.qs({limit: size, offset: this.page * size, sort: this.sort, order: this.order})}`);
     const pages = Math.max(1, Math.ceil(res.total / size));
-    const th = (k, l, n) => `<th class="${n ? "n" : ""}" data-sort="${k}">${l}${this.sort === k ? (this.order === "asc" ? " ▲" : " ▼") : ""}</th>`;
+    const th = (k, l, n) => `<th class="${n ? "n" : ""}" data-sort="${k}">${l}${this.sort === k ? (this.order === "asc" ? " \u25b2" : " \u25bc") : ""}</th>`;
     const sel = (name, label, inner) => `<label>${label}<select name="${name}"><option value="">${t("all")}</option>${inner}</select></label>`;
     c.innerHTML = `<div class="card bar" id="filters">
       ${sel("person", t("person"), `<option value="none" ${f.person === "none" ? "selected" : ""}>${t("unknown")}</option>${this.opts("people", f.person, {empty: null, archived: true})}`)}
@@ -184,13 +185,13 @@ class PrintLogPanel extends HTMLElement {
           <td>${esc(p.person) || `<span class="badge">${t("pick")}</span>`}</td><td>${esc(p.role)}</td><td>${esc(p.filament) || `<span class="badge">${t("pick")}</span>`}</td>
           ${multi ? `<td>${esc(p.printer)}</td>` : ""}<td class="n">${dur(p.duration_s)}</td><td class="n">${p.length_m.toFixed(2)}</td>
           <td class="n">${p.energy_kwh == null ? "" : p.energy_kwh.toFixed(2) + " kWh"}</td><td class="n">${this.money(p.total_cost)}</td>
-          <td class="n">${this.money(p.price)}${p.sale_price != null ? " ✎" : ""}</td><td class="n">${this.money(p.profit)}</td>
-          <td>${p.paid ? `<span class="ok">✓ ${this.dday(p.paid_at)}</span>` : ""}</td>
+          <td class="n">${this.money(p.price)}${p.sale_price != null ? " \u270e" : ""}</td><td class="n">${this.money(p.profit)}</td>
+          <td>${p.paid ? `<span class="ok">\u2713 ${this.dday(p.paid_at)}</span>` : ""}</td>
           <td class="st-${p.status}">${this.stLabel(p.status)}</td>
-          <td>${this.admin ? `<button class="tiny sec" data-edit="${p.id}">✎</button> <button class="tiny danger" data-del="${p.id}">✕</button>` : ""}</td></tr>`).join("") ||
+          <td>${this.admin ? `<button class="tiny sec" data-edit="${p.id}">\u270e</button> <button class="tiny danger" data-del="${p.id}">\u2715</button>` : ""}</td></tr>`).join("") ||
           `<tr><td colspan="17" class="muted">${t("no_prints")}</td></tr>`}</tbody></table>
-        <div class="pager"><button class="sec tiny" id="prev" ${this.page <= 0 ? "disabled" : ""}>←</button><span>${this.page + 1} / ${pages}</span>
-        <button class="sec tiny" id="next" ${this.page + 1 >= pages ? "disabled" : ""}>→</button></div></div>`;
+        <div class="pager"><button class="sec tiny" id="prev" ${this.page <= 0 ? "disabled" : ""}>\u2190</button><span>${this.page + 1} / ${pages}</span>
+        <button class="sec tiny" id="next" ${this.page + 1 >= pages ? "disabled" : ""}>\u2192</button></div></div>`;
     c.querySelectorAll("#filters select,#filters input").forEach((el) => (el.onchange = () => { this.filters[el.name] = el.value; this.page = 0; this.render(); }));
     c.querySelector("#reset").onclick = () => { this.filters = {}; this.page = 0; this.render(); };
     c.querySelectorAll("th[data-sort]").forEach((el) => (el.onclick = () => { const k = el.dataset.sort; this.order = this.sort === k && this.order === "desc" ? "asc" : "desc"; this.sort = k; this.render(); }));
@@ -279,7 +280,7 @@ class PrintLogPanel extends HTMLElement {
     return `<div class="card" style="overflow:auto"><div class="bar" style="margin-bottom:8px"><b>${title}</b>${addBtn && this.admin ? `<button id="add" style="margin-left:auto">${this.t("new")}</button>` : ""}</div>
       <table><thead><tr>${headers.map((x) => `<th>${x}</th>`).join("")}</tr></thead><tbody>${rowsHtml}</tbody></table></div>`;
   }
-  actions(r) { return this.admin ? `<button class="tiny sec" data-edit="${r.id}">✎</button> <button class="tiny danger" data-del="${r.id}">✕</button>` : ""; }
+  actions(r) { return this.admin ? `<button class="tiny sec" data-edit="${r.id}">\u270e</button> <button class="tiny danger" data-del="${r.id}">\u2715</button>` : ""; }
   bindActions(c, table, rows, editFn) {
     c.querySelector("#add")?.addEventListener("click", () => editFn(null));
     c.querySelectorAll("[data-edit]").forEach((b) => (b.onclick = () => editFn(rows.find((r) => r.id == b.dataset.edit))));
